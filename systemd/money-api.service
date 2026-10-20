@@ -1,0 +1,15 @@
+[Unit]
+Description=money API (for the dashboard)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/money/money.env
+WorkingDirectory=/opt/money
+ExecStart=/opt/money/venv/bin/uvicorn app.api:app --host 0.0.0.0 --port 8090 --log-level warning
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

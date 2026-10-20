@@ -1,0 +1,10 @@
+[Unit]
+Description=money sync 3x a day (PSD2 allows 4 unattended pulls per account per day)
+
+[Timer]
+OnCalendar=*-*-* 07,13,19:15
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

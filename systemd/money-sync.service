@@ -1,0 +1,11 @@
+[Unit]
+Description=money sync (banks + Trade Republic -> Firefly III)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/money/money.env
+WorkingDirectory=/opt/money
+ExecStart=/opt/money/venv/bin/python -m app.sync
+TimeoutStartSec=30min
