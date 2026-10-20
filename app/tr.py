@@ -119,7 +119,8 @@ def portfolio(tr) -> dict:
 
 
 # TR event types that move money between your own pockets or into securities, not spending
-INVEST = {"BUY", "SELL", "DIVIDEND", "SPINOFF", "SPLIT", "SWAP", "TRANSFER_IN", "TRANSFER_OUT"}
+INVEST = {"BUY", "SELL", "DIVIDEND", "SPINOFF", "SPLIT", "SWAP", "TRANSFER_IN", "TRANSFER_OUT",
+          "TRADE_INVOICE", "SAVEBACK", "PRIVATE_MARKETS_ORDER"}
 
 
 def transactions(tr, since: float) -> list[dict]:
@@ -139,7 +140,7 @@ def transactions(tr, since: float) -> list[dict]:
             continue
         if e.value in (None, 0) or e.event_type is None:
             continue
-        kind = getattr(e.event_type, "value", str(e.event_type))
+        kind = getattr(e.event_type, "name", None) or str(e.event_type)
         out.append({"id": ev["id"], "date": e.date.date().isoformat() if isinstance(e.date, datetime) else str(e.date)[:10],
                     "amount": round(float(e.value), 2), "payee": e.title or "Trade Republic",
                     "purpose": " · ".join(x for x in [ev.get("subtitle"), e.note] if x), "kind": kind,

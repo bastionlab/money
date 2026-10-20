@@ -118,7 +118,7 @@ def sync_tr(c, summary: dict, new: list[dict]) -> None:
         since = _since(a["last_sync"], 7)
         txs = tr.transactions(t, datetime.combine(since, datetime.min.time()).timestamp())
         rows = [{"key": f"tr:{x['id']}", "date": x["date"], "amount": x["amount"], "payee": x["payee"],
-                 "purpose": x["purpose"] or x["kind"], "notes": x["kind"],
+                 "purpose": x["purpose"] or str(x["kind"]), "notes": str(x["kind"]),
                  "category": "Investments" if x["invest"] else None} for x in txs]
         with store.connect() as con:
             n = _book(c, con, a, rows, new)
