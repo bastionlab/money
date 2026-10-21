@@ -1,9 +1,11 @@
 """Pushes for things that need a tap (consent renewals, TR login) or a look (subs, unusual charges, month report).
-A Discord webhook once you paste one on the dashboard; else Telegram (own bot, else the deals bot)."""
+Discord (#money, or #alerts for logins/consents/failures) once the dashboard has the webhooks; else Telegram."""
 from __future__ import annotations
 
+import json
 import logging
 import re
+from pathlib import Path
 
 import httpx
 
@@ -52,34 +54,25 @@ def view() -> dict:
             s["telegram"]["chat_id"] = chat
             save_secrets(s)
             own["chat_id"] = chat
-    dc = secrets().get("discord") or {}
-    return {"discord": bool(dc.get("url")), "discord_name": dc.get("name"), "own": bool(own.get("token")), "bot": own.get("bot"), "chat": bool(own.get("chat_id")),
+    return {"discord": bool(_hook("money")), "discord_alerts": bool(_hook("alerts")), "own": bool(own.get("token")), "bot": own.get("bot"), "chat": bool(own.get("chat_id")),
             "fallback": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)}
 
 
-DISCORD_HOOK = re.compile(r"^https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+$")
+HOOKS = Path("/etc/discord.json")  # written by the dashboard agent: {"money": url, "alerts": url, …}
 
 
-def setup_discord(url: str) -> dict:
-    s = secrets()
-    if not url:  # empty = back to Telegram
-        s.pop("discord", None)
-        save_secrets(s)
-        return view()
-    if not DISCORD_HOOK.match(url):
-        raise ValueError("Das ist keine Discord-Webhook-URL")
-    r = httpx.get(url, timeout=15)
-    if r.status_code != 200:
-        raise ValueError("Discord kennt diesen Webhook nicht")
-    s["discord"] = {"url": url, "name": r.json().get("name")}
-    save_secrets(s)
-    return view()
+def _hook(channel: str) -> str | None:
+    try:
+        return json.loads(HOOKS.read_text()).get(channel) or None
+    except (OSError, ValueError):
+        return None
 
 
 def _markdown(html: str) -> str:
     """The messages are written as Telegram HTML; Discord speaks markdown."""
     t = re.sub(r"</?b>", "**", html)
     t = re.sub(r"</?i>", "*", t)
+    t = re.sub(r"</?code>", "`", t)
     t = re.sub(r'<a href="([^"]+)">([^<]*)</a>', r"[\2](\1)", t)
     t = re.sub(r"<[^>]+>", "", t)
     return t.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
@@ -99,10 +92,11 @@ def _send_discord(url: str, text: str) -> bool:
         return False
 
 
-def send(text: str) -> bool:
-    dc = (secrets().get("discord") or {}).get("url")
+def send(text: str, channel: str = "money") -> bool:
+    """channel: "money" for things to look at, "alerts" for things that need fixing (logins, consents, failed syncs)"""
+    dc = _hook(channel) or _hook("money")
     if dc:
-        return _send_discord(dc, text)
+        return _send_discord(dc, ("💶 " if channel == "alerts" else "") + text)
     token, chat, own = target()
     if not (token and chat):
         return False

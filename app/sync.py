@@ -197,10 +197,10 @@ def _tr_relogin():
     store.put("tr_auto_login", time.time())
     try:
         return tr.unattended_login(lambda: notify.send(
-            "Trade Republic möchte einen neuen Login – bitte jetzt in der TR-App bestätigen (2 Min)."))
+            "Trade Republic möchte einen neuen Login – bitte jetzt in der TR-App bestätigen (2 Min).", "alerts"))
     except Exception as e:  # noqa: BLE001
         log.info("tr relogin: %s", e)
-        notify.send(f"Trade-Republic-Login nicht bestätigt. Neu anmelden: {REDIRECT_URL}")
+        notify.send(f"Trade-Republic-Login nicht bestätigt. Neu anmelden: {REDIRECT_URL}", "alerts")
         return None
 
 
@@ -312,7 +312,7 @@ def remind_consents() -> None:
     soon = (datetime.now(timezone.utc) + timedelta(days=REMIND_DAYS)).isoformat()
     with store.connect() as con:
         for l in con.execute("SELECT * FROM links WHERE valid_until < ? AND reminded < ?", (soon, time.time() - 86400)):
-            notify.send(f"{l['aspsp']}: Kontozugriff läuft am {l['valid_until'][:10]} ab – einmal neu verbinden: {REDIRECT_URL}")
+            notify.send(f"{l['aspsp']}: Kontozugriff läuft am {l['valid_until'][:10]} ab – einmal neu verbinden: {REDIRECT_URL}", "alerts")
             con.execute("UPDATE links SET reminded=? WHERE session_id=?", (time.time(), l["session_id"]))
 
 
@@ -341,6 +341,11 @@ def run() -> dict:
         log.exception("sync failed")
         summary["error"] = str(e)[:300]
         ok = 0
+        if not store.get("sync_fail_sent"):  # once per outage, an all-clear when it works again
+            store.put("sync_fail_sent", notify.send(f"Sync fehlgeschlagen: <code>{summary['error'][:200]}</code>", "alerts"))
+    if ok and store.get("sync_fail_sent"):
+        store.put("sync_fail_sent", False)
+        notify.send("✅ Sync läuft wieder", "alerts")
     with store.connect() as con:
         con.execute("INSERT INTO runs (started,finished,ok,summary) VALUES (?,?,?,?)",
                     (started, time.time(), ok, json.dumps(summary)))
