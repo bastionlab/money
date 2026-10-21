@@ -219,25 +219,37 @@ def _is_own(payee: str, own: set[str]) -> bool:
     return bool(OWN_PARTIES.search(p)) or any(o and o in p for o in own)
 
 
+def own_transfer(payee: str, purpose: str, own: set[str]) -> bool:
+    """Money to/from yourself: your own name as the other side (DKB 'Erika Mustermann' ↔ TR), or a bare PayPal
+    top-up/payout ('PAYPAL INSTANT TRANSFER', TR 'Gesendet' to PayPal) -- not a PayPal purchase ('Ihr Einkauf bei X')."""
+    p = (payee or "").lower()
+    if any(o and o in p for o in own):
+        return True
+    return ai.norm_payee(payee) in ("paypal", "pay pal") and "einkauf bei" not in (purpose or "").lower()
+
+
 def categorize(c, new: list[dict]) -> int:
     if not new:
         return 0
     # what you (or earlier runs) decided for the same payee wins over asking the model
+    own = _own_names()
     # money in and money out are remembered apart: an employer's payments in are Gehalt even if a refund to it was not
     memory: dict[tuple, Counter] = defaultdict(Counter)
     for s in firefly.splits(c, date.today() - timedelta(days=HISTORY_DAYS), date.today()):
         cat = s.get("category_name")
-        if cat and cat not in ("Sonstiges", "Umbuchung"):
-            other = s.get("destination_name") if s["type"] == "withdrawal" else s.get("source_name")
+        other = s.get("destination_name") if s["type"] == "withdrawal" else s.get("source_name")
+        if cat and cat not in ("Sonstiges", "Umbuchung") and not own_transfer(other, "", own):
             memory[(s["type"] == "deposit", ai.norm_payee(other or ""))][cat] += 1
     todo = []
     for r in new:
+        if own_transfer(r["payee"], r["purpose"], own):
+            r["category"] = "Umbuchung"
+            continue
         k = (r["amount"] > 0, ai.norm_payee(r["payee"]) or ai.norm_payee(r["purpose"]))
         if k[1] and memory.get(k):
             r["category"] = memory[k].most_common(1)[0][0]
         else:
             todo.append(r)
-    own = _own_names()
     for r, cat in zip(todo, ai.categorize(todo)):
         # Umbuchung means between your own accounts; the model also says it for an employer's "Abschlag/Vorschuss"
         if cat == "Umbuchung" and not _is_own(r["payee"], own):
@@ -264,7 +276,7 @@ def pair_transfers(c) -> int:
     """Money moving between your own accounts shows up twice (DKB −50, TR +50): mark both 'Umbuchung'."""
     with store.connect() as con:
         own = {r["firefly_id"] for r in con.execute("SELECT firefly_id FROM accounts WHERE firefly_id IS NOT NULL")}
-    sp = [s for s in firefly.splits(c, date.today() - timedelta(days=45), date.today())
+    sp = [s for s in firefly.splits(c, date.today() - timedelta(days=HISTORY_DAYS + 30), date.today())
           if s.get("category_name") != "Investments" and s["type"] in ("withdrawal", "deposit")]
     # PayPal top-ups were already paired with their bank debit when booked; never pair them again
     sp = [s for s in sp if not (s.get("description") or "").startswith("PayPal-Aufladung")]
