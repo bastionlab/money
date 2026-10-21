@@ -10,7 +10,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
 
-from . import ai, eb, firefly, notify, store, subs, tr
+from . import ai, depot, eb, firefly, notify, store, subs, tr
 from .config import HISTORY_DAYS, REDIRECT_URL, REMIND_DAYS
 
 log = logging.getLogger("sync")
@@ -130,6 +130,11 @@ def sync_tr(c, summary: dict, new: list[dict]) -> None:
         if not a["last_sync"] and rows:
             _opening(c, a, pf["cash"], min(r["date"] for r in rows))
         summary["Trade Republic"] = n
+        try:
+            summary["depot"] = depot.rebuild(t, pf["positions"])
+        except Exception as e:  # noqa: BLE001 - the chart history is a nice-to-have
+            log.warning("depot history: %s", e)
+            summary["depot"] = f"error: {str(e)[:80]}"
     except Exception as e:  # noqa: BLE001
         log.warning("tr: %s", e)
         with store.connect() as con:

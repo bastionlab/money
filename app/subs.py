@@ -75,12 +75,69 @@ def detect(splits: list[dict]) -> list[dict]:
     return found
 
 
+PER_DAYS = {name: days for name, days, _ in PERIODS}
+
+
+def guess_period(days: list[date]) -> str:
+    if len(days) < 2:
+        return "monthly"
+    gaps = [(b - a).days for a, b in zip(days, days[1:])]
+    name, _ = _period(gaps)
+    if name:
+        return name
+    med = statistics.median(gaps)
+    return min(PER_DAYS, key=lambda k: abs(PER_DAYS[k] - med))
+
+
+def matches(sub: dict, splits: list[dict]) -> list[dict]:
+    """Withdrawals that belong to a hand-picked subscription: same payee key, amount within 25% (a price step)."""
+    out = []
+    for s in splits:
+        if s["type"] != "withdrawal":
+            continue
+        k = norm_payee(s.get("destination_name") or "") or norm_payee(s.get("description") or "")
+        if k != sub["pkey"]:
+            continue
+        if sub.get("match_amount") and abs(float(s["amount"]) - sub["match_amount"]) > 0.25 * sub["match_amount"]:
+            continue
+        out.append(s)
+    return sorted(out, key=lambda s: s["date"])
+
+
+def refresh_manual(con, sub: dict, splits: list[dict]) -> dict | None:
+    """Recompute last/next charge and price of a hand-picked subscription from the bookings."""
+    rows = matches(sub, splits)
+    if not rows:
+        return None
+    per = PER_DAYS[sub["period"]]
+    last = rows[-1]
+    amt = round(float(last["amount"]), 2)
+    prev = round(float(rows[-2]["amount"]), 2) if len(rows) > 1 else amt
+    last_day = date.fromisoformat(last["date"][:10])
+    nxt = last_day + timedelta(days=round(per))
+    state = "active" if date.today() <= nxt + timedelta(days=round(per * 0.5) + 5) else "ended"
+    moved = sub.get("last_date") and sub["last_date"] != last_day.isoformat() and abs(amt - (sub.get("amount") or amt)) >= 0.01
+    if moved:
+        notify.send(f"Preisänderung: <b>{sub.get('name') or sub['payee']}</b> {sub['amount']:.2f} € → {amt:.2f} €")
+    con.execute("UPDATE subs SET amount=?, prev_amount=?, last_date=?, next_date=?, count=?, state=?, match_amount=?, "
+                "changed=COALESCE(?,changed) WHERE key=?",
+                (amt, sub["amount"] if moved else prev, last_day.isoformat(), nxt.isoformat(), len(rows), state, amt,
+                 store.now() if moved else None, sub["key"]))
+    return {"amount": amt, "last_date": last_day.isoformat(), "next_date": nxt.isoformat(), "state": state}
+
+
 def update(splits: list[dict]) -> dict:
     """Upsert detections; push a note for new subscriptions and price changes."""
-    found = detect(splits)
+    with store.connect() as con:
+        manual = [dict(r) for r in con.execute("SELECT * FROM subs WHERE manual=1")]
+        for m in manual:
+            refresh_manual(con, m, splits)
+    # a hand-picked subscription wins over the detector for the same payee and price
+    found = [f for f in detect(splits) if not any(
+        m["pkey"] == f["key"] and abs(f["amount"] - (m["match_amount"] or f["amount"])) <= 0.25 * f["amount"] for m in manual)]
     new = changed = 0
     with store.connect() as con:
-        old = {r["key"]: dict(r) for r in con.execute("SELECT * FROM subs")}
+        old = {r["key"]: dict(r) for r in con.execute("SELECT * FROM subs WHERE manual=0")}
         first_run = not old
         for f in found:
             o = old.get(f["key"])

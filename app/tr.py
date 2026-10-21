@@ -146,3 +146,64 @@ def transactions(tr, since: float) -> list[dict]:
                     "purpose": " · ".join(x for x in [ev.get("subtitle"), e.note] if x), "kind": kind,
                     "invest": kind in INVEST or bool(e.isin)})
     return out
+
+
+def _run(tr, coro):
+    """pytr keeps one websocket bound to the loop that opened it; each asyncio.run needs a fresh one."""
+    tr._ws = None
+    return asyncio.run(coro)
+
+
+async def _one(tr, payload: dict, timeout: float = 20):
+    """Subscribe, take the first answer, unsubscribe."""
+    sid = await tr.subscribe(payload)
+    while True:
+        s, _, resp = await asyncio.wait_for(tr.recv(), timeout)
+        if s == sid:
+            await tr.unsubscribe(sid)
+            return resp
+
+
+def trades(tr) -> list[dict]:
+    """Every buy/sell (savings plan, round-up, saveback, manual order) over the whole account history:
+    {isin, day, shares (+ bought / − sold), amount (cash moved, − for a buy)}. Only ~2 s even for all of it."""
+    from pytr.event import Event
+    from pytr.timeline import Timeline
+    with tempfile.TemporaryDirectory() as d:
+        tl = Timeline(tr, Path(d), not_before=0, store_event_database=False)
+        _run(tr, tl.tl_loop())
+        raw = tl.events
+    out = []
+    for ev in raw:
+        try:
+            e = Event.from_dict(ev)
+        except Exception:  # noqa: BLE001
+            continue
+        if not e.isin or not e.shares:
+            continue
+        value = float(e.value or 0)
+        kind = getattr(e.event_type, "name", "") or ""
+        sell = value > 0 or kind == "SELL"
+        out.append({"isin": e.isin, "day": e.date.date().isoformat() if isinstance(e.date, datetime) else str(e.date)[:10],
+                    "shares": -abs(float(e.shares)) if sell else abs(float(e.shares)), "amount": value})
+    return sorted(out, key=lambda x: x["day"])
+
+
+def instrument(tr, isin: str) -> dict:
+    r = _run(tr, _one(tr, {"type": "instrument", "id": isin}))
+    return {"short": r.get("shortName") or isin, "name": r.get("name") or "", "type": r.get("typeId") or "",
+            "exchange": next((x for x in ["LSX", *(r.get("exchangeIds") or [])] if x in (r.get("exchangeIds") or ["LSX"])), "LSX")}
+
+
+def closes(tr, isin: str, exchange: str = "LSX") -> dict[str, float]:
+    """Daily closes for the last year, weekly before that (TR's 'max' range is weekly)."""
+    out: dict[str, float] = {}
+
+    async def both():
+        weekly = await _one(tr, {"type": "aggregateHistoryLight", "id": f"{isin}.{exchange}", "range": "max"})
+        daily = await _one(tr, {"type": "aggregateHistoryLight", "id": f"{isin}.{exchange}", "range": "1y"})
+        return weekly, daily
+    for r in _run(tr, both()):
+        for a in r.get("aggregates") or []:
+            out[datetime.fromtimestamp(a["time"] / 1000).date().isoformat()] = float(a.get("close") or a.get("adjValue"))
+    return dict(sorted(out.items()))

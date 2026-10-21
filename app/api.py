@@ -16,8 +16,9 @@ from datetime import date, timedelta
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
-from . import eb, firefly, store, tr
-from .config import CATEGORIES, NOT_SPENDING, save_secrets, secrets
+from . import eb, firefly, store, subs, tr
+from .ai import norm_payee
+from .config import CATEGORIES, HISTORY_DAYS, NOT_SPENDING, save_secrets, secrets
 
 TOKEN = os.environ.get("MONEY_API_TOKEN", "")
 ALLOWED = {ip for ip in os.environ.get("MONEY_API_ALLOW", "192.168.1.54,192.168.1.50,127.0.0.1").split(",") if ip}
@@ -53,17 +54,42 @@ def _month_bounds(m: str) -> tuple[date, date]:
     return start, end
 
 
+def _all_splits() -> list[dict]:
+    """Every booking of the history window, cached a few minutes (search, payee history, picking subscriptions)."""
+    hit = _cache.get("_all")
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    with firefly.client() as c:
+        sp = firefly.splits(c, date.today() - timedelta(days=HISTORY_DAYS + 30), date.today() + timedelta(days=1))
+    _cache["_all"] = (time.time(), sp)
+    return sp
+
+
+def _tx(s: dict) -> dict:
+    withdrawal = s["type"] == "withdrawal"
+    return {"group_id": s["group_id"], "journal_id": s["transaction_journal_id"], "date": s["date"][:10],
+            "amount": -float(s["amount"]) if withdrawal else float(s["amount"]),
+            "payee": s["destination_name"] if withdrawal else s["source_name"],
+            "description": s["description"], "category": s.get("category_name"),
+            "account": s["source_name"] if withdrawal else s["destination_name"]}
+
+
+def _pkey(s: dict) -> str:
+    other = s.get("destination_name") if s["type"] == "withdrawal" else s.get("source_name")
+    return norm_payee(other or "") or norm_payee(s.get("description") or "")
+
+
 def _ledger(month: str) -> dict:
-    """Spending/income for the month + 6-month trend, straight from Firefly (so edits there show up)."""
+    """Spending/income for the month + 12-month trend, straight from Firefly (so edits there show up)."""
     hit = _cache.get(month)
     if hit and time.time() - hit[0] < 120:
         return hit[1]
     start, end = _month_bounds(month)
-    trend_start = (start - timedelta(days=160)).replace(day=1)
+    trend_start = (start - timedelta(days=340)).replace(day=1)
     with firefly.client() as c:
         sp = firefly.splits(c, trend_start, end)
     months: dict[str, dict] = defaultdict(lambda: {"income": 0.0, "spending": 0.0})
-    cats: dict[str, float] = defaultdict(float)
+    cats: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))  # month -> cat -> €
     recent = []
     for s in sp:
         cat = s.get("category_name") or "Sonstiges"
@@ -80,24 +106,27 @@ def _ledger(month: str) -> dict:
         else:  # refund booked under a spending category
             months[m]["spending"] -= amt
             delta = -amt
-        if m == month and delta:
-            cats[cat] += delta
+        if delta:
+            cats[m][cat] += delta
     for s in sorted(sp, key=lambda s: s["date"], reverse=True):
-        if s["date"][:7] != month or s["type"] not in ("withdrawal", "deposit"):
-            continue
-        withdrawal = s["type"] == "withdrawal"
-        recent.append({"group_id": s["group_id"], "journal_id": s["transaction_journal_id"], "date": s["date"][:10],
-                       "amount": -float(s["amount"]) if withdrawal else float(s["amount"]),
-                       "payee": s["destination_name"] if withdrawal else s["source_name"],
-                       "description": s["description"], "category": s.get("category_name"),
-                       "account": s["source_name"] if withdrawal else s["destination_name"]})
+        if s["date"][:7] == month and s["type"] in ("withdrawal", "deposit"):
+            recent.append(_tx(s))
+    # what a category usually costs: the mean of the 3 months before this one
+    prev = []
+    p = start
+    for _ in range(3):
+        p = (p - timedelta(days=1)).replace(day=1)
+        prev.append(p.strftime("%Y-%m"))
+    seen_prev = [m for m in prev if m in months]
+    avg = {k: sum(cats[m].get(k, 0) for m in seen_prev) / len(seen_prev) for k in CATEGORIES} if seen_prev else {}
     out = {"month": month,
            "income": round(months[month]["income"], 2), "spending": round(months[month]["spending"], 2),
-           "categories": sorted(({"name": k, "amount": round(v, 2)} for k, v in cats.items() if round(v, 2) > 0),
-                                key=lambda x: -x["amount"]),
+           "categories": sorted(({"name": k, "amount": round(v, 2), "avg": round(avg.get(k, 0), 2)}
+                                 for k, v in cats[month].items() if round(v, 2) > 0), key=lambda x: -x["amount"]),
+           "avg_spending": round(sum(months[m]["spending"] for m in seen_prev) / len(seen_prev), 2) if seen_prev else None,
            "trend": [{"month": k, "income": round(v["income"], 2), "spending": round(v["spending"], 2)}
-                     for k, v in sorted(months.items())][-6:],
-           "transactions": recent[:300]}
+                     for k, v in sorted(months.items()) if k <= month][-12:],
+           "transactions": recent[:1500]}
     _cache[month] = (time.time(), out)
     return out
 
@@ -111,6 +140,7 @@ def overview(month: str | None = None) -> dict:
         pf = [dict(r) for r in con.execute("SELECT day,value,cash,invested FROM portfolio ORDER BY day")]
         last_pos = con.execute("SELECT positions FROM portfolio ORDER BY day DESC LIMIT 1").fetchone()
         subs = [dict(r) for r in con.execute("SELECT * FROM subs WHERE dismissed=0 ORDER BY state, amount DESC")]
+        hidden = [dict(r) for r in con.execute("SELECT key,payee,name,amount,period FROM subs WHERE dismissed=1 ORDER BY payee")]
         run = con.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
     ledger, ledger_error = None, None
     try:
@@ -128,10 +158,144 @@ def overview(month: str | None = None) -> dict:
         "last_run": dict(run) | {"summary": json.loads(run["summary"])} if run else None,
         "accounts": accounts, "links": links,
         "net_worth": round(cash + invest_value, 2), "cash": round(cash, 2), "invested_value": round(invest_value, 2),
-        "portfolio": {"series": pf[-400:], "positions": json.loads(last_pos["positions"]) if last_pos else []},
-        "subs": subs, "subs_monthly": round(monthly_subs, 2),
+        "portfolio": {"series": pf[-2:], "positions": _labelled(json.loads(last_pos["positions"]) if last_pos else [])},
+        "subs": subs, "subs_hidden": hidden, "subs_monthly": round(monthly_subs, 2),
         "ledger": ledger, "ledger_error": ledger_error, "categories": CATEGORIES,
     }
+
+
+def _labelled(positions: list[dict]) -> list[dict]:
+    built = (store.get("depot") or {}).get("positions", {})
+    total = sum(p["value"] for p in positions) or 1
+    return [p | {"label": built.get(p["isin"], {}).get("label") or p["name"], "share": round(p["value"] / total, 4)}
+            for p in positions]
+
+
+@app.get("/depot", dependencies=[Depends(guard)])
+def depot_history() -> dict:
+    """Per-position and total depot value + cost basis over time (rebuilt every sync from trades × prices)."""
+    return store.get("depot") or {"positions": {}, "total": []}
+
+
+@app.get("/tx/search", dependencies=[Depends(guard)])
+def tx_search(q: str = "", limit: int = 200) -> dict:
+    """Across the whole history: payee, purpose, category, account, or an amount ('12,99')."""
+    q = q.strip().lower()
+    if not q:
+        return {"q": q, "transactions": []}
+    try:
+        num = float(q.replace("€", "").replace(".", "").replace(",", ".")) if any(ch.isdigit() for ch in q) else None
+    except ValueError:
+        num = None
+    out = []
+    for s in sorted(_all_splits(), key=lambda s: s["date"], reverse=True):
+        if s["type"] not in ("withdrawal", "deposit"):
+            continue
+        hay = " ".join(str(s.get(k) or "") for k in ("destination_name", "source_name", "description", "category_name")).lower()
+        if q in hay or (num is not None and abs(abs(float(s["amount"])) - abs(num)) < 0.005):
+            out.append(_tx(s))
+            if len(out) >= min(limit, 500):
+                break
+    return {"q": q, "transactions": out}
+
+
+@app.get("/payee", dependencies=[Depends(guard)])
+def payee(name: str) -> dict:
+    """Everything booked with one payee: list, monthly totals, and whether it already is a subscription."""
+    key = norm_payee(name)
+    rows = sorted((s for s in _all_splits() if s["type"] in ("withdrawal", "deposit") and _pkey(s) == key),
+                  key=lambda s: s["date"], reverse=True)
+    txs = [_tx(s) for s in rows]
+    by_month: dict[str, float] = defaultdict(float)
+    for t in txs:
+        by_month[t["date"][:7]] += t["amount"]
+    with store.connect() as con:
+        sub = [dict(r) for r in con.execute("SELECT * FROM subs WHERE (pkey=? OR key=?)", (key, key))]
+    year_ago = (date.today() - timedelta(days=365)).isoformat()
+    return {"key": key, "transactions": txs[:300],
+            "months": [{"month": k, "amount": round(v, 2)} for k, v in sorted(by_month.items())],
+            "total_12m": round(sum(t["amount"] for t in txs if t["date"] >= year_ago), 2),
+            "count": len(txs), "subs": sub}
+
+
+class SubKey(BaseModel):
+    key: str
+
+
+class SubAdd(BaseModel):
+    journal_ids: list[str]
+    period: str | None = None
+    name: str | None = None
+
+
+@app.post("/subs/add", dependencies=[Depends(guard)])
+def subs_add(body: SubAdd) -> dict:
+    """You pick the bookings that are one subscription; payee + price + rhythm come from them."""
+    ids = set(body.journal_ids)
+    picked = sorted((s for s in _all_splits() if s["transaction_journal_id"] in ids and s["type"] == "withdrawal"),
+                    key=lambda s: s["date"])
+    if not picked:
+        raise HTTPException(400, "keine Abbuchungen ausgewählt")
+    keys = {_pkey(s) for s in picked}
+    if len(keys) > 1 or not next(iter(keys)):
+        raise HTTPException(400, "die Buchungen gehören zu verschiedenen Empfängern")
+    pkey = keys.pop()
+    amounts = sorted(float(s["amount"]) for s in picked)
+    median = amounts[len(amounts) // 2]
+    days = sorted({date.fromisoformat(s["date"][:10]) for s in picked})
+    period = body.period if body.period in subs.PER_DAYS else subs.guess_period(days)
+    key = f"m:{pkey}:{round(median)}"
+    sub = {"key": key, "payee": picked[-1].get("destination_name") or pkey, "name": (body.name or "").strip()[:80] or None,
+           "category": picked[-1].get("category_name"), "period": period, "amount": round(float(picked[-1]["amount"]), 2),
+           "pkey": pkey, "match_amount": round(float(picked[-1]["amount"]), 2)}
+    with store.connect() as con:
+        con.execute("INSERT INTO subs (key,payee,name,category,period,amount,prev_amount,count,first_seen,state,manual,pkey,match_amount,dismissed) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,0) ON CONFLICT(key) DO UPDATE SET period=excluded.period, name=COALESCE(excluded.name,name), dismissed=0",
+                    (key, sub["payee"], sub["name"], sub["category"], period, sub["amount"], sub["amount"], len(picked),
+                     store.now(), "active", pkey, sub["match_amount"]))
+        # the detector's row for the same payee/price would double-count it
+        con.execute("UPDATE subs SET dismissed=1 WHERE manual=0 AND key=? AND abs(amount-?) <= 0.25*?", (pkey, median, median))
+        row = dict(con.execute("SELECT * FROM subs WHERE key=?", (key,)).fetchone())
+        subs.refresh_manual(con, row, _all_splits())
+    return {"ok": True, "key": key, "period": period}
+
+
+class SubEdit(BaseModel):
+    key: str
+    period: str | None = None
+    name: str | None = None
+
+
+@app.post("/subs/edit", dependencies=[Depends(guard)])
+def subs_edit(body: SubEdit) -> dict:
+    with store.connect() as con:
+        row = con.execute("SELECT * FROM subs WHERE key=?", (body.key,)).fetchone()
+        if not row:
+            raise HTTPException(404, "kein solches Abo")
+        if body.period in subs.PER_DAYS:
+            nxt = None
+            if row["last_date"]:
+                nxt = (date.fromisoformat(row["last_date"]) + timedelta(days=round(subs.PER_DAYS[body.period]))).isoformat()
+            con.execute("UPDATE subs SET period=?, next_date=COALESCE(?,next_date) WHERE key=?", (body.period, nxt, body.key))
+        if body.name is not None:
+            con.execute("UPDATE subs SET name=? WHERE key=?", (body.name.strip()[:80] or None, body.key))
+    return {"ok": True}
+
+
+@app.post("/subs/remove", dependencies=[Depends(guard)])
+def subs_remove(body: SubKey) -> dict:
+    """Hand-picked: gone. Detected: hidden (restorable)."""
+    with store.connect() as con:
+        con.execute("DELETE FROM subs WHERE key=? AND manual=1", (body.key,))
+        con.execute("UPDATE subs SET dismissed=1 WHERE key=?", (body.key,))
+    return {"ok": True}
+
+
+@app.post("/subs/restore", dependencies=[Depends(guard)])
+def subs_restore(body: SubKey) -> dict:
+    with store.connect() as con:
+        con.execute("UPDATE subs SET dismissed=0 WHERE key=?", (body.key,))
+    return {"ok": True}
 
 
 @app.post("/sync", dependencies=[Depends(guard)])
@@ -306,10 +470,6 @@ def tx_category(body: TxCategory) -> dict:
         firefly.set_category(c, body.group_id, body.journal_id, body.category)
     _cache.clear()
     return {"ok": True}
-
-
-class SubKey(BaseModel):
-    key: str
 
 
 @app.post("/subs/dismiss", dependencies=[Depends(guard)])

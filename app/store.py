@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS subs (
 );
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 """
+# subscriptions you add yourself (picked from bookings): pinned, matched by payee key + amount, never auto-ended away
+MIGRATE_SUBS = [("manual", "INTEGER DEFAULT 0"), ("pkey", "TEXT"), ("match_amount", "REAL"), ("name", "TEXT")]
 
 
 @contextmanager
@@ -40,6 +42,10 @@ def connect():
     con = sqlite3.connect(DB, timeout=30)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(subs)")}
+    for col, decl in MIGRATE_SUBS:
+        if col not in cols:
+            con.execute(f"ALTER TABLE subs ADD COLUMN {col} {decl}")
     try:
         yield con
         con.commit()
