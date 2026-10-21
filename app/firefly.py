@@ -55,7 +55,12 @@ def ensure_asset(c: httpx.Client, name: str, iban: str | None, currency: str = "
     body = {"name": name, "type": "asset", "account_role": "defaultAsset", "currency_code": currency}
     if iban:
         body["iban"] = iban
-    return _check(c.post("/accounts", json=body))["data"]["id"]
+    r = c.post("/accounts", json=body)
+    if r.status_code == 422 and "currency" in r.text:
+        # PayPal reports multi-currency wallets with codes Firefly has not enabled; book them in the default (EUR)
+        body.pop("currency_code")
+        r = c.post("/accounts", json=body)
+    return _check(r)["data"]["id"]
 
 
 def set_opening_balance(c: httpx.Client, account_id: str, amount: float, day: date) -> None:
