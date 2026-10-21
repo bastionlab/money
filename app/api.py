@@ -464,16 +464,34 @@ class TxCategory(BaseModel):
     group_id: str
     journal_id: str
     category: str
+    scope: str = "one"   # one | payee
 
 
 @app.post("/tx/category", dependencies=[Depends(guard)])
 def tx_category(body: TxCategory) -> dict:
+    """One booking, or every booking with the same payee in the same direction (money in / out stay apart),
+    plus a rule so future bookings from that payee land there too. Transfers/investments are left alone."""
     if body.category not in CATEGORIES:
         raise HTTPException(400, "unknown category")
+    n = 1
     with firefly.client() as c:
         firefly.set_category(c, body.group_id, body.journal_id, body.category)
+        if body.scope == "payee":
+            sp = _all_splits()
+            me = next((s for s in sp if s["transaction_journal_id"] == body.journal_id), None)
+            key = _pkey(me) if me else ""
+            if key:
+                for s in sp:
+                    if s["type"] == me["type"] and s["transaction_journal_id"] != body.journal_id and _pkey(s) == key \
+                            and s.get("category_name") != body.category and s.get("category_name") not in NOT_SPENDING:
+                        firefly.set_category(c, s["group_id"], s["transaction_journal_id"], body.category)
+                        n += 1
+                rules = store.get("payee_rules", {}) or {}
+                rules[f"{me['type']}:{key}"] = body.category
+                store.put("payee_rules", rules)
     _cache.clear()
-    return {"ok": True}
+    return {"ok": True, "changed": n}
+
 
 
 @app.post("/subs/dismiss", dependencies=[Depends(guard)])

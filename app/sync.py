@@ -240,10 +240,15 @@ def categorize(c, new: list[dict]) -> int:
         other = s.get("destination_name") if s["type"] == "withdrawal" else s.get("source_name")
         if cat and cat not in ("Sonstiges", "Umbuchung") and not own_transfer(other, "", own):
             memory[(s["type"] == "deposit", ai.norm_payee(other or ""))][cat] += 1
+    rules = store.get("payee_rules", {}) or {}  # set from the dashboard: "all bookings with this payee"
     todo = []
     for r in new:
         if own_transfer(r["payee"], r["purpose"], own):
             r["category"] = "Umbuchung"
+            continue
+        rule = rules.get(f"{'deposit' if r['amount'] > 0 else 'withdrawal'}:{ai.norm_payee(r['payee']) or ai.norm_payee(r['purpose'])}")
+        if rule:
+            r["category"] = rule
             continue
         k = (r["amount"] > 0, ai.norm_payee(r["payee"]) or ai.norm_payee(r["purpose"]))
         if k[1] and memory.get(k):
