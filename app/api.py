@@ -16,7 +16,7 @@ from datetime import date, timedelta
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
-from . import eb, firefly, store, subs, tr
+from . import eb, firefly, insights, notify, store, subs, tr
 from .ai import norm_payee
 from .config import CATEGORIES, HISTORY_DAYS, NOT_SPENDING, save_secrets, secrets
 
@@ -69,9 +69,19 @@ def _all_splits() -> list[dict]:
     return sp
 
 
+def _aliases() -> dict:
+    hit = _cache.get("_aliases")
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    a = store.get("aliases", {}) or {}
+    _cache["_aliases"] = (time.time(), a)
+    return a
+
+
 def _tx(s: dict) -> dict:
     withdrawal = s["type"] == "withdrawal"
     return {"group_id": s["group_id"], "journal_id": s["transaction_journal_id"], "date": s["date"][:10],
+            "alias": _aliases().get(_pkey(s)),
             "amount": -float(s["amount"]) if withdrawal else float(s["amount"]),
             "payee": s["destination_name"] if withdrawal else s["source_name"],
             "description": s["description"], "category": s.get("category_name"),
@@ -131,8 +141,45 @@ def _ledger(month: str) -> dict:
            "trend": [{"month": k, "income": round(v["income"], 2), "spending": round(v["spending"], 2)}
                      for k, v in sorted(months.items()) if k <= month][-12:],
            "transactions": recent[:1500]}
+    if month == date.today().strftime("%Y-%m"):
+        out["forecast"] = _forecast(out, [months[m] for m in prev if m in months], sp)
     _cache[month] = (time.time(), out)
     return out
+
+
+def _forecast(L: dict, prev: list[dict], sp: list[dict]) -> dict:
+    """Month end, roughly: what's spent + Abos still due + the usual day-to-day pace for the days left,
+    and the salary if it hasn't come yet."""
+    today = date.today()
+    start, end = _month_bounds(today.strftime("%Y-%m"))
+    left = (end - today).days
+    with store.connect() as con:
+        active = [dict(r) for r in con.execute("SELECT * FROM subs WHERE dismissed=0 AND state='active'")]
+    step = {"weekly": 7, "monthly": 30.4, "quarterly": 91, "yearly": 365}
+    due = 0.0
+    for x in active:
+        d = date.fromisoformat(x["next_date"]) if x.get("next_date") else None
+        while d and d <= end:
+            if d > today:
+                due += x["amount"]
+            d += timedelta(days=round(step[x["period"]]))
+    subs_month = sum(x["amount"] * 30.4 / step[x["period"]] for x in active)
+    spend_prev = sorted(p["spending"] for p in prev)
+    usual = spend_prev[len(spend_prev) // 2] if spend_prev else L["spending"] / max(today.day, 1) * 30.4
+    pace = max(0.0, usual - subs_month) / (end.day)  # everyday spending per day, without the Abos
+    spend = L["spending"] + due + pace * left
+    # salary: the usual Gehalt of the last months, minus what came in already
+    gehalt: dict[str, float] = defaultdict(float)
+    for x in sp:
+        if x["type"] == "deposit" and x.get("category_name") == "Gehalt":
+            gehalt[x["date"][:7]] += float(x["amount"])
+    this = gehalt.pop(today.strftime("%Y-%m"), 0.0)
+    past = sorted(v for k, v in gehalt.items() if k >= (start - timedelta(days=95)).strftime("%Y-%m"))
+    usual_pay = past[len(past) // 2] if past else 0.0
+    income = L["income"] + max(0.0, usual_pay - this)
+    return {"spending": round(spend, 2), "income": round(income, 2), "saldo": round(income - spend, 2),
+            "subs_due": round(due, 2), "pace_day": round(pace, 2), "days_left": left,
+            "rest_out": round(spend - L["spending"], 2), "rest_in": round(income - L["income"], 2)}
 
 
 @app.get("/overview", dependencies=[Depends(guard)])
@@ -156,14 +203,14 @@ def overview(month: str | None = None) -> dict:
     monthly_subs = sum(s["amount"] * {"weekly": 4.33, "monthly": 1, "quarterly": 1 / 3, "yearly": 1 / 12}[s["period"]]
                        for s in subs if s["state"] == "active")
     return {
-        "setup": {"eb": eb.configured(), "tr": tr.configured(), "tr_login": login.view(),
+        "setup": {"eb": eb.configured(), "tr": tr.configured(), "tr_login": login.view(), "telegram": notify.view(),
                   "eb_app_id": secrets().get("eb", {}).get("app_id", "")[:8]},
         "syncing": _syncing(),
         "last_run": dict(run) | {"summary": json.loads(run["summary"])} if run else None,
         "accounts": accounts, "links": links,
         "net_worth": round(cash + invest_value, 2), "cash": round(cash, 2), "invested_value": round(invest_value, 2),
         "portfolio": {"series": pf[-2:], "positions": _labelled(json.loads(last_pos["positions"]) if last_pos else [])},
-        "subs": subs, "subs_hidden": hidden, "subs_monthly": round(monthly_subs, 2),
+        "subs": [x | {"alias": _aliases().get(x.get("pkey") or x["key"])} for x in subs], "subs_hidden": hidden, "subs_monthly": round(monthly_subs, 2),
         "ledger": ledger, "ledger_error": ledger_error, "categories": CATEGORIES,
     }
 
@@ -196,6 +243,7 @@ def tx_search(q: str = "", limit: int = 200) -> dict:
         if s["type"] not in ("withdrawal", "deposit"):
             continue
         hay = " ".join(str(s.get(k) or "") for k in ("destination_name", "source_name", "description", "category_name")).lower()
+        hay += " " + (_aliases().get(_pkey(s)) or "").lower()
         if q in hay or (num is not None and abs(abs(float(s["amount"])) - abs(num)) < 0.005):
             out.append(_tx(s))
             if len(out) >= min(limit, 500):
@@ -300,6 +348,99 @@ def subs_restore(body: SubKey) -> dict:
     with store.connect() as con:
         con.execute("UPDATE subs SET dismissed=0 WHERE key=?", (body.key,))
     return {"ok": True}
+
+
+class Rename(BaseModel):
+    name: str
+    alias: str = ""
+
+
+@app.post("/payee/rename", dependencies=[Depends(guard)])
+def payee_rename(body: Rename) -> dict:
+    """A readable name for a payee ('H.R..Ullrich.Handels.Ge/Berlin' -> 'Ullrich'), shown everywhere; empty = back to the bank's."""
+    key = norm_payee(body.name)
+    if not key:
+        raise HTTPException(400, "kein Empfänger")
+    a = store.get("aliases", {}) or {}
+    if body.alias.strip():
+        a[key] = body.alias.strip()[:60]
+    else:
+        a.pop(key, None)
+    store.put("aliases", a)
+    _cache.clear()
+    return {"ok": True, "key": key}
+
+
+@app.get("/tx/export", dependencies=[Depends(guard)])
+def tx_export(start: str, end: str) -> dict:
+    a, b = date.fromisoformat(start), date.fromisoformat(end)
+    with firefly.client() as c:
+        sp = firefly.splits(c, a, b)
+    return {"transactions": [_tx(s) for s in sorted(sp, key=lambda s: s["date"]) if s["type"] in ("withdrawal", "deposit")][:20000]}
+
+
+@app.get("/anomalies", dependencies=[Depends(guard)])
+def anomalies(month: str) -> dict:
+    start, end = _month_bounds(month)
+    out = insights.anomalies(_all_splits(), start, end)
+    for x in out:
+        x["alias"] = _aliases().get(norm_payee(x["payee"] or ""))
+    return {"anomalies": out}
+
+
+class Jid(BaseModel):
+    journal_id: str
+
+
+@app.post("/anomalies/ok", dependencies=[Depends(guard)])
+def anomaly_ok(body: Jid) -> dict:
+    ok = store.get("anomaly_ok", []) or []
+    ok.append(body.journal_id)
+    store.put("anomaly_ok", ok[-2000:])
+    return {"ok": True}
+
+
+@app.get("/networth", dependencies=[Depends(guard)])
+def networth() -> dict:
+    hit = _cache.get("_nw")
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    with firefly.client() as c:
+        out = insights.networth(c)
+    _cache["_nw"] = (time.time(), out)
+    return out
+
+
+class Token(BaseModel):
+    token: str
+
+
+@app.post("/telegram/config", dependencies=[Depends(guard)])
+def telegram_config(body: Token) -> dict:
+    try:
+        return notify.setup_own(body.token.strip())
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, str(e)[:200]) from e
+
+
+@app.post("/telegram/test", dependencies=[Depends(guard)])
+def telegram_test() -> dict:
+    v = notify.view()
+    return v | {"sent": notify.send("✅ Money-Benachrichtigungen kommen ab jetzt hier an.")}
+
+
+@app.get("/report", dependencies=[Depends(guard)])
+def report(month: str) -> dict:
+    return {"text": insights.month_report(month)}
+
+
+class Month(BaseModel):
+    month: str
+
+
+@app.post("/report/send", dependencies=[Depends(guard)])
+def report_send(body: Month) -> dict:
+    return {"sent": notify.send(insights.month_report(body.month))}
 
 
 @app.post("/sync", dependencies=[Depends(guard)])

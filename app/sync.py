@@ -11,7 +11,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
 
-from . import ai, depot, eb, firefly, notify, store, subs, tr
+from . import ai, depot, eb, firefly, insights, notify, store, subs, tr
 from .config import HISTORY_DAYS, REDIRECT_URL, REMIND_DAYS
 
 log = logging.getLogger("sync")
@@ -328,8 +328,14 @@ def run() -> dict:
             sync_tr(c, summary, new)
             summary["categorized"] = categorize(c, new)
             summary["transfers"] = pair_transfers(c)
-            summary |= subs.update(firefly.splits(c, date.today() - timedelta(days=HISTORY_DAYS), date.today()))
+            all_splits = firefly.splits(c, date.today() - timedelta(days=HISTORY_DAYS), date.today())
+            summary |= subs.update(all_splits)
+            summary["unusual"] = insights.notify_new_anomalies(all_splits)
         remind_consents()
+        try:
+            summary["report"] = insights.maybe_month_report()
+        except Exception as e:  # noqa: BLE001
+            log.warning("month report: %s", e)
     except Exception as e:  # noqa: BLE001
         log.exception("sync failed")
         summary["error"] = str(e)[:300]
