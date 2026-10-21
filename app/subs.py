@@ -2,20 +2,26 @@
 from __future__ import annotations
 
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, timedelta
 
 from . import notify, store
 from .ai import norm_payee
 from .config import NOT_SPENDING
 
+# a bakery or a Döner place you visit regularly is a habit, not a subscription
+NEVER_SUBS = {"Lebensmittel", "Restaurant & Lieferdienst", "Bargeld"}
 PERIODS = [("weekly", 7, 2), ("monthly", 30.4, 4), ("quarterly", 91, 8), ("yearly", 365, 20)]
 
 
 def _period(gaps: list[int]):
-    med = statistics.median(gaps)
+    """Fixed rhythm, allowing skipped cycles (Netflix paused a month): each gap counts as k periods."""
     for name, days, slack in PERIODS:
-        if abs(med - days) <= slack and all(abs(g - days) <= slack * 2 for g in gaps[-3:]):
+        ks = [max(1, round(g / days)) for g in gaps]
+        norm = [g / k for g, k in zip(gaps, ks)]
+        if sum(ks) > 2 * len(gaps):  # more skipped than paid: not a rhythm
+            continue
+        if abs(statistics.median(norm) - days) <= slack and all(abs(n - days) <= slack * 2 for n in norm[-4:]):
             return name, days
     return None, None
 
@@ -23,7 +29,7 @@ def _period(gaps: list[int]):
 def detect(splits: list[dict]) -> list[dict]:
     groups: dict[str, list[dict]] = defaultdict(list)
     for s in splits:
-        if s["type"] != "withdrawal" or (s.get("category_name") or "") in NOT_SPENDING:
+        if s["type"] != "withdrawal" or (s.get("category_name") or "") in NOT_SPENDING | NEVER_SUBS:
             continue
         key = norm_payee(s.get("destination_name") or "") or norm_payee(s.get("description") or "")
         if key and key not in ("unbekannt",):
@@ -32,21 +38,38 @@ def detect(splits: list[dict]) -> list[dict]:
     today = date.today()
     for key, rows in groups.items():
         rows.sort(key=lambda r: r["date"])
-        days = sorted({date.fromisoformat(r["date"][:10]) for r in rows})
+        # the recurring charge is the one close to the latest amount; one-off purchases at the same
+        # payee (a Netflix gift card, a second Google bill) and old prices further back drop out
+        recent = [round(float(r["amount"]), 2) for r in rows[-6:]]
+        mode, n = Counter(recent).most_common(1)[0]
+        last_amt = mode if n > 1 else recent[-1]
+        chain = [r for r in rows if abs(float(r["amount"]) - last_amt) <= 0.2 * last_amt]
+        # walk back through price steps (Google 20.99 -> 23.99 -> 27.99): an older charge joins while it is
+        # within 20% of the oldest one kept so far and its month has no charge yet
+        months = {r["date"][:7] for r in chain}
+        for r in reversed([r for r in rows if r not in chain]):
+            oldest = min(chain, key=lambda c: c["date"])
+            if r["date"] < oldest["date"] and r["date"][:7] not in months and \
+                    abs(float(r["amount"]) - float(oldest["amount"])) <= 0.2 * float(oldest["amount"]):
+                chain.append(r)
+                months.add(r["date"][:7])
+        chain.sort(key=lambda r: r["date"])
+        days = sorted({date.fromisoformat(r["date"][:10]) for r in chain})
         if len(days) < 2:
             continue
         gaps = [(b - a).days for a, b in zip(days, days[1:])]
         name, per = _period(gaps)
         if not name or (name != "yearly" and len(days) < 3):
             continue
-        amounts = [float(r["amount"]) for r in rows]
+        chain = [r for r in chain if r["date"][:10] in {d.isoformat() for d in days}]
+        amounts = [float(r["amount"]) for r in chain]
         last, prev = amounts[-1], amounts[-2]
-        # a supermarket you visit monthly is not a subscription: the amounts wander
-        if statistics.pstdev(amounts[-4:]) > 0.15 * statistics.mean(amounts[-4:]) and abs(last - prev) > 0.15 * prev:
+        # a bakery you pass every week is not a subscription: weekly needs a fixed price
+        if name == "weekly" and statistics.pstdev(amounts[-4:]) > 0.05 * statistics.mean(amounts[-4:]):
             continue
         nxt = days[-1] + timedelta(days=round(per))
         state = "active" if today <= nxt + timedelta(days=round(per * 0.5) + 5) else "ended"
-        found.append({"key": key, "payee": rows[-1].get("destination_name") or key, "category": rows[-1].get("category_name"),
+        found.append({"key": key, "payee": chain[-1].get("destination_name") or key, "category": chain[-1].get("category_name"),
                       "period": name, "amount": round(last, 2), "prev_amount": round(prev, 2),
                       "last_date": days[-1].isoformat(), "next_date": nxt.isoformat(), "count": len(days), "state": state})
     return found

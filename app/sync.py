@@ -172,6 +172,15 @@ def categorize(c, new: list[dict]) -> int:
             todo.append(r)
     for r, cat in zip(todo, ai.categorize(todo)):
         r["category"] = cat
+    # the model judges line by line and can call one AWS bill "Software" and the next "Lebensmittel":
+    # within one run, every payee gets its majority category
+    votes: dict[str, Counter] = defaultdict(Counter)
+    for r in todo:
+        votes[ai.norm_payee(r["payee"])][r["category"]] += 1
+    for r in todo:
+        k = ai.norm_payee(r["payee"])
+        if k and sum(votes[k].values()) > 1:
+            r["category"] = votes[k].most_common(1)[0][0]
     for r in new:
         try:
             firefly.set_category(c, r["group_id"], r["journal_id"], r["category"])
