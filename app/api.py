@@ -39,6 +39,8 @@ async def guard(request: Request, authorization: str = Header(default="")) -> No
 
 def kick_sync() -> None:
     _cache.clear()
+    if _syncing():  # a run already going may have loaded the account list before this change: run once more after it
+        store.put("sync_again", True)
     subprocess.run(["systemctl", "start", "--no-block", "money-sync.service"], check=False)
 
 

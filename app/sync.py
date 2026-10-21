@@ -3,6 +3,7 @@ pair own-account transfers, snapshot the portfolio, refresh subscriptions, and n
 from __future__ import annotations
 
 import hashlib
+import re
 import json
 import logging
 import sys
@@ -37,6 +38,14 @@ def _book(c, con, acc: dict, rows: list[dict], new: list[dict]) -> int:
             con.execute("INSERT OR IGNORE INTO seen VALUES (?,?,?)", (r["key"], None, store.now()))
             continue
         con.execute("INSERT OR IGNORE INTO seen VALUES (?,?,?)", (r["key"], jid, store.now()))
+        if r.get("fund"):  # the DKB debit that paid this PayPal purchase is a top-up, not a second purchase
+            f = r["fund"]
+            firefly.set_category(c, f["group_id"], f["transaction_journal_id"], "Umbuchung")
+            try:
+                firefly.add(c, account_id=acc["firefly_id"], amount=float(f["amount"]), day=f["date"][:10], payee=f["source_name"] or "Bank",
+                            description=f"PayPal-Aufladung für {r['payee']}", external_id=(r["key"] + ":fund")[:250], category="Umbuchung")
+            except firefly.Duplicate:
+                pass
         con.commit()
         n += 1
         if not cat:
@@ -56,9 +65,44 @@ def _eb_rows(uid: str, txs: list[dict]) -> list[dict]:
         purpose = " ".join(t.get("remittance_information") or []).strip()
         ref = t.get("entry_reference") or t.get("transaction_id") or hashlib.sha1(json.dumps(
             [t.get("booking_date"), amt, party.get("name"), purpose], sort_keys=True).encode()).hexdigest()[:20]
-        rows.append({"key": f"eb:{uid}:{ref}", "date": t.get("booking_date") or t.get("value_date"),
+        rows.append({"key": f"eb:{uid}:{ref}", "date": t.get("booking_date") or t.get("value_date") or t.get("transaction_date"),
                      "amount": amt, "payee": (party.get("name") or purpose[:60] or "").strip(), "purpose": purpose})
     return rows
+
+
+PAYPAL_DEBIT = re.compile(r"paypal|\bPP\.\d|ihr einkauf bei", re.I)
+
+
+def _paypal_funding(c, con, acc: dict, rows: list[dict]) -> None:
+    """PayPal purchases are paid by a bank debit ('… PP.6299.PP … Ihr Einkauf bei Google') that is already booked.
+    Pair each new PayPal purchase with that debit (same amount, bank books it 0-7 days later): the purchase keeps
+    the debit's category, and the debit becomes a transfer to PayPal -- so it is counted once."""
+    todo = [r for r in rows if r["amount"] < 0 and not con.execute("SELECT 1 FROM seen WHERE key=?", (r["key"],)).fetchone()]
+    if not todo:
+        return
+    days = [date.fromisoformat(r["date"]) for r in todo]
+    pool = [s for s in firefly.splits(c, min(days) - timedelta(days=3), max(days) + timedelta(days=10))
+            if s["type"] == "withdrawal" and s["source_id"] != acc["firefly_id"] and s.get("category_name") != "Umbuchung"
+            and PAYPAL_DEBIT.search(f"{s.get('description') or ''} {s.get('notes') or ''}")]
+    for r, d in zip(todo, days):
+        best = None
+        for s in pool:
+            gap = (date.fromisoformat(s["date"][:10]) - d).days
+            if abs(float(s["amount"]) - abs(r["amount"])) < 0.005 and -2 <= gap <= 7 and (best is None or abs(gap) < best[0]):
+                best = (abs(gap), s)
+        if not best:  # partly paid from the PayPal balance: the bank debit is smaller, but names the same shop
+            first = (ai.norm_payee(r["payee"]).split() or [""])[0]
+            for s in pool:
+                gap = (date.fromisoformat(s["date"][:10]) - d).days
+                if first and (ai.norm_payee(s.get("destination_name") or "").split() or [""])[0] == first \
+                        and float(s["amount"]) < abs(r["amount"]) and -2 <= gap <= 7 and (best is None or abs(gap) < best[0]):
+                    best = (abs(gap), s)
+        if best:
+            s = best[1]
+            pool.remove(s)
+            r["fund"] = s
+            if s.get("category_name") and s["category_name"] != "Sonstiges":
+                r["category"] = s["category_name"]
 
 
 def sync_eb(c, summary: dict, new: list[dict]) -> None:
@@ -75,7 +119,9 @@ def sync_eb(c, summary: dict, new: list[dict]) -> None:
             uid = a["key"][3:]
             try:
                 bal = eb.balance(uid)
-                rows = _eb_rows(uid, eb.transactions(uid, _since(a["last_sync"], 10).isoformat()))
+                rows = [r for r in _eb_rows(uid, eb.transactions(uid, _since(a["last_sync"], 10).isoformat())) if r["date"]]
+                if a["name"].lower().startswith("paypal"):
+                    _paypal_funding(c, con, a, rows)
                 n = _book(c, con, a, rows, new)
                 con.execute("UPDATE accounts SET balance=?, balance_at=?, last_sync=?, error=NULL WHERE key=?",
                             (bal, store.now(), store.now(), a["key"]))
@@ -257,4 +303,10 @@ if __name__ == "__main__":
     for noisy in ("httpx", "pytr", "websockets"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     print(json.dumps(run(), ensure_ascii=False))
+    # a bank linked or 'sync now' tapped while this run was busy: go again so it isn't left for the next timer
+    for _ in range(2):
+        if not store.get("sync_again"):
+            break
+        store.put("sync_again", False)
+        print(json.dumps(run(), ensure_ascii=False))
     sys.exit(0)
