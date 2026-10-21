@@ -95,6 +95,17 @@ def set_category(c: httpx.Client, group_id: str, journal_id: str, category: str)
         "apply_rules": False, "transactions": [{"transaction_journal_id": journal_id, "category_name": category}]}))
 
 
+def update(c: httpx.Client, group_id: str, journal_id: str, **fields) -> None:
+    tx = {"transaction_journal_id": journal_id} | {k: f"{v:.2f}" if k == "amount" else v for k, v in fields.items()}
+    _check(c.put(f"/transactions/{group_id}", json={"apply_rules": False, "transactions": [tx]}))
+
+
+def delete(c: httpx.Client, group_id: str) -> None:
+    r = c.delete(f"/transactions/{group_id}")
+    if r.status_code not in (204, 404):
+        _check(r)
+
+
 def splits(c: httpx.Client, start: date, end: date) -> list[dict]:
     """All splits in a date range, flattened, each tagged with its group id."""
     out = []

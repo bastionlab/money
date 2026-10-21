@@ -11,7 +11,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
 
-from . import ai, depot, eb, firefly, insights, notify, store, subs, tr
+from . import ai, cashback, depot, eb, firefly, insights, notify, store, subs, tr
 from .config import HISTORY_DAYS, REDIRECT_URL, REMIND_DAYS
 
 log = logging.getLogger("sync")
@@ -328,6 +328,7 @@ def run() -> dict:
             sync_tr(c, summary, new)
             summary["categorized"] = categorize(c, new)
             summary["transfers"] = pair_transfers(c)
+            summary["cashback"] = cashback.split(c)
             all_splits = firefly.splits(c, date.today() - timedelta(days=HISTORY_DAYS), date.today())
             summary |= subs.update(all_splits)
             summary["unusual"] = insights.notify_new_anomalies(all_splits)

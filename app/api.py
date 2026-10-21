@@ -423,6 +423,18 @@ def telegram_config(body: Token) -> dict:
         raise HTTPException(400, str(e)[:200]) from e
 
 
+class Hook(BaseModel):
+    url: str
+
+
+@app.post("/discord/config", dependencies=[Depends(guard)])
+def discord_config(body: Hook) -> dict:
+    try:
+        return notify.setup_discord(body.url.strip())
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, str(e)[:200]) from e
+
+
 @app.post("/telegram/test", dependencies=[Depends(guard)])
 def telegram_test() -> dict:
     v = notify.view()
