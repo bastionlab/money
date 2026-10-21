@@ -23,6 +23,8 @@ from .config import CATEGORIES, HISTORY_DAYS, NOT_SPENDING, save_secrets, secret
 TOKEN = os.environ.get("MONEY_API_TOKEN", "")
 ALLOWED = {ip for ip in os.environ.get("MONEY_API_ALLOW", "192.168.1.54,192.168.1.50,127.0.0.1").split(",") if ip}
 INCOME = {"Gehalt", "Sonstige Einnahmen"}
+# money in under these is income too (a tax refund, an unsorted payment), not a refund that lowers spending
+INCOME_LIKE = {"Sonstiges", "Steuern", "Geschenke & Spenden"}
 
 app = FastAPI(title="money", docs_url=None, redoc_url=None)
 log = logging.getLogger("api")
@@ -102,7 +104,7 @@ def _ledger(month: str) -> dict:
         if s["type"] == "withdrawal":
             months[m]["spending"] += amt
             delta = amt
-        elif cat in INCOME or not s.get("category_name"):
+        elif cat in INCOME or cat in INCOME_LIKE or not s.get("category_name"):
             months[m]["income"] += amt
             delta = 0
         else:  # refund booked under a spending category

@@ -204,33 +204,53 @@ def _tr_relogin():
         return None
 
 
+OWN_PARTIES = re.compile(r"paypal|trade republic|dkb|deutsche kreditbank", re.I)
+
+
+def _own_names() -> set[str]:
+    """Account holder names ('DKB Erika Mustermann' -> 'maximilian mirnik') to tell your own transfers apart."""
+    with store.connect() as con:
+        names = [r["name"] for r in con.execute("SELECT name FROM accounts")]
+    return {" ".join(n.lower().split()[1:3]) for n in names if len(n.split()) >= 3}
+
+
+def _is_own(payee: str, own: set[str]) -> bool:
+    p = (payee or "").lower()
+    return bool(OWN_PARTIES.search(p)) or any(o and o in p for o in own)
+
+
 def categorize(c, new: list[dict]) -> int:
     if not new:
         return 0
     # what you (or earlier runs) decided for the same payee wins over asking the model
-    memory: dict[str, Counter] = defaultdict(Counter)
+    # money in and money out are remembered apart: an employer's payments in are Gehalt even if a refund to it was not
+    memory: dict[tuple, Counter] = defaultdict(Counter)
     for s in firefly.splits(c, date.today() - timedelta(days=HISTORY_DAYS), date.today()):
         cat = s.get("category_name")
-        if cat and cat != "Sonstiges":
+        if cat and cat not in ("Sonstiges", "Umbuchung"):
             other = s.get("destination_name") if s["type"] == "withdrawal" else s.get("source_name")
-            memory[ai.norm_payee(other or "")][cat] += 1
+            memory[(s["type"] == "deposit", ai.norm_payee(other or ""))][cat] += 1
     todo = []
     for r in new:
-        k = ai.norm_payee(r["payee"]) or ai.norm_payee(r["purpose"])
-        if k and memory.get(k):
+        k = (r["amount"] > 0, ai.norm_payee(r["payee"]) or ai.norm_payee(r["purpose"]))
+        if k[1] and memory.get(k):
             r["category"] = memory[k].most_common(1)[0][0]
         else:
             todo.append(r)
+    own = _own_names()
     for r, cat in zip(todo, ai.categorize(todo)):
+        # Umbuchung means between your own accounts; the model also says it for an employer's "Abschlag/Vorschuss"
+        if cat == "Umbuchung" and not _is_own(r["payee"], own):
+            cat = "Sonstige Einnahmen" if r["amount"] > 0 else "Sonstiges"
         r["category"] = cat
     # the model judges line by line and can call one AWS bill "Software" and the next "Lebensmittel":
     # within one run, every payee gets its majority category
-    votes: dict[str, Counter] = defaultdict(Counter)
+    votes: dict[tuple, Counter] = defaultdict(Counter)
     for r in todo:
-        votes[ai.norm_payee(r["payee"])][r["category"]] += 1
+        votes[(r["amount"] > 0, ai.norm_payee(r["payee"]))][r["category"]] += 1
     for r in todo:
-        k = ai.norm_payee(r["payee"])
-        if k and sum(votes[k].values()) > 1:
+        k = (r["amount"] > 0, ai.norm_payee(r["payee"]))
+        if k[1] and sum(votes[k].values()) > 1:
             r["category"] = votes[k].most_common(1)[0][0]
     for r in new:
         try:
@@ -246,6 +266,9 @@ def pair_transfers(c) -> int:
         own = {r["firefly_id"] for r in con.execute("SELECT firefly_id FROM accounts WHERE firefly_id IS NOT NULL")}
     sp = [s for s in firefly.splits(c, date.today() - timedelta(days=45), date.today())
           if s.get("category_name") != "Investments" and s["type"] in ("withdrawal", "deposit")]
+    # PayPal top-ups were already paired with their bank debit when booked; never pair them again
+    sp = [s for s in sp if not (s.get("description") or "").startswith("PayPal-Aufladung")]
+    names = _own_names()
     outs = [s for s in sp if s["type"] == "withdrawal" and s["source_id"] in own]
     ins = [s for s in sp if s["type"] == "deposit" and s["destination_id"] in own]
     used, n = set(), 0
@@ -255,6 +278,9 @@ def pair_transfers(c) -> int:
             if i["transaction_journal_id"] in used or i["destination_id"] == o["source_id"]:
                 continue
             if o.get("category_name") == i.get("category_name") == "Umbuchung":
+                continue
+            # same amount by chance (a 10 € card payment vs 10 € from a friend) is not a transfer: one side must name you or a bank
+            if not (_is_own(o.get("destination_name"), names) or _is_own(i.get("source_name"), names)):
                 continue
             if abs(float(i["amount"]) - float(o["amount"])) < 0.005 and abs((date.fromisoformat(i["date"][:10]) - od).days) <= 4:
                 used.add(i["transaction_journal_id"])
