@@ -1,6 +1,7 @@
 """Subscriptions = recurring withdrawals to the same payee at a steady rhythm and a similar amount."""
 from __future__ import annotations
 
+import json
 import statistics
 from collections import Counter, defaultdict
 from datetime import date, timedelta
@@ -89,19 +90,59 @@ def guess_period(days: list[date]) -> str:
     return min(PER_DAYS, key=lambda k: abs(PER_DAYS[k] - med))
 
 
+def pkey_of(s: dict) -> str:
+    other = s.get("destination_name") if s["type"] == "withdrawal" else s.get("source_name")
+    return norm_payee(other or "") or norm_payee(s.get("description") or "")
+
+
 def matches(sub: dict, splits: list[dict]) -> list[dict]:
-    """Withdrawals that belong to a hand-picked subscription: same payee key, amount within 25% (a price step)."""
+    """Bookings that belong to a hand-picked subscription: same payee key, amount within 25% (a price step).
+    Income ('in') looks at deposits, and at one account only when it was picked from one (Taschengeld on DKB,
+    not the odd PayPal from the same person)."""
+    want = "deposit" if sub.get("kind") == "in" else "withdrawal"
+    acct = sub.get("match_account")
     out = []
     for s in splits:
-        if s["type"] != "withdrawal":
+        if s["type"] != want or pkey_of(s) != sub["pkey"]:
             continue
-        k = norm_payee(s.get("destination_name") or "") or norm_payee(s.get("description") or "")
-        if k != sub["pkey"]:
+        if acct and (s.get("destination_name") if want == "deposit" else s.get("source_name")) != acct:
             continue
         if sub.get("match_amount") and abs(float(s["amount"]) - sub["match_amount"]) > 0.25 * sub["match_amount"]:
             continue
         out.append(s)
     return sorted(out, key=lambda s: s["date"])
+
+
+def share_rows(sub: dict, splits: list[dict]) -> list[tuple[dict, dict]]:
+    """Deposits that are a friend's part of this Abo: same payer, amount within 40% of what they pay."""
+    shares = json.loads(sub.get("shares") or "[]")
+    out = []
+    for s in splits:
+        if s["type"] != "deposit":
+            continue
+        k = pkey_of(s)
+        for sh in shares:
+            if sh["pkey"] == k and abs(float(s["amount"]) - sh["amount"]) <= 0.4 * sh["amount"]:
+                out.append((s, sh))
+                break
+    return out
+
+
+def share_view(sub: dict, splits: list[dict]) -> list[dict]:
+    """Per payer: latest part and whether they still pay (a payment within ~1.5 periods)."""
+    per = PER_DAYS.get(sub.get("period") or "monthly", 30.4)
+    last: dict[str, dict] = {}
+    for s, sh in share_rows(sub, splits):
+        if sh["pkey"] not in last or s["date"] > last[sh["pkey"]]["date"]:
+            last[sh["pkey"]] = s
+    out = []
+    for sh in json.loads(sub.get("shares") or "[]"):
+        s = last.get(sh["pkey"])
+        d = s["date"][:10] if s else None
+        active = bool(d) and (date.today() - date.fromisoformat(d)).days <= per * 1.5 + 5
+        out.append({"pkey": sh["pkey"], "payee": sh.get("payee") or sh["pkey"], "amount": round(float(s["amount"]), 2) if s else sh["amount"],
+                    "last_date": d, "active": active})
+    return out
 
 
 def refresh_manual(con, sub: dict, splits: list[dict]) -> dict | None:
@@ -113,15 +154,28 @@ def refresh_manual(con, sub: dict, splits: list[dict]) -> dict | None:
     last = rows[-1]
     amt = round(float(last["amount"]), 2)
     prev = round(float(rows[-2]["amount"]), 2) if len(rows) > 1 else amt
+    if sub.get("kind") == "in" and not sub.get("match_amount"):
+        # a salary paid in parts (Abschlag + Abrechnung): the usual month total of the last 3 finished months
+        by_month: dict[str, float] = defaultdict(float)
+        for r in rows:
+            by_month[r["date"][:7]] += float(r["amount"])
+        done = [v for k, v in sorted(by_month.items()) if k < date.today().strftime("%Y-%m")][-3:] or list(by_month.values())
+        if sub["period"] == "monthly":
+            amt = prev = round(sum(done) / len(done), 2)
     last_day = date.fromisoformat(last["date"][:10])
     nxt = last_day + timedelta(days=round(per))
+    if sub["period"] == "monthly":  # same day next month (Taschengeld on the 1st stays on the 1st)
+        y, m = divmod(last_day.month, 12)
+        nxt = date(last_day.year + y, m + 1, min(last_day.day, 28 if m + 1 == 2 else 30 if m + 1 in (4, 6, 9, 11) else 31))
     state = "active" if date.today() <= nxt + timedelta(days=round(per * 0.5) + 5) else "ended"
-    moved = sub.get("last_date") and sub["last_date"] != last_day.isoformat() and abs(amt - (sub.get("amount") or amt)) >= 0.01
+    moved = sub.get("kind") != "in" and sub.get("last_date") and sub["last_date"] != last_day.isoformat() \
+        and abs(amt - (sub.get("amount") or amt)) >= 0.01
     if moved:
         notify.send(f"Preisänderung: <b>{sub.get('name') or sub['payee']}</b> {sub['amount']:.2f} € → {amt:.2f} €")
     con.execute("UPDATE subs SET amount=?, prev_amount=?, last_date=?, next_date=?, count=?, state=?, match_amount=?, "
                 "changed=COALESCE(?,changed) WHERE key=?",
-                (amt, sub["amount"] if moved else prev, last_day.isoformat(), nxt.isoformat(), len(rows), state, amt,
+                (amt, sub["amount"] if moved else prev, last_day.isoformat(), nxt.isoformat(), len(rows), state,
+                 amt if sub.get("kind") != "in" or sub.get("match_amount") else None,
                  store.now() if moved else None, sub["key"]))
     return {"amount": amt, "last_date": last_day.isoformat(), "next_date": nxt.isoformat(), "state": state}
 
@@ -134,7 +188,7 @@ def update(splits: list[dict]) -> dict:
             refresh_manual(con, m, splits)
     # a hand-picked subscription wins over the detector for the same payee and price
     found = [f for f in detect(splits) if not any(
-        m["pkey"] == f["key"] and abs(f["amount"] - (m["match_amount"] or f["amount"])) <= 0.25 * f["amount"] for m in manual)]
+        m.get("kind") != "in" and m["pkey"] == f["key"] and abs(f["amount"] - (m["match_amount"] or f["amount"])) <= 0.25 * f["amount"] for m in manual)]
     new = changed = 0
     with store.connect() as con:
         old = {r["key"]: dict(r) for r in con.execute("SELECT * FROM subs WHERE manual=0")}

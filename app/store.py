@@ -33,7 +33,10 @@ CREATE TABLE IF NOT EXISTS subs (
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 """
 # subscriptions you add yourself (picked from bookings): pinned, matched by payee key + amount, never auto-ended away
-MIGRATE_SUBS = [("manual", "INTEGER DEFAULT 0"), ("pkey", "TEXT"), ("match_amount", "REAL"), ("name", "TEXT")]
+MIGRATE_SUBS = [("manual", "INTEGER DEFAULT 0"), ("pkey", "TEXT"), ("match_amount", "REAL"), ("name", "TEXT"),
+                # kind 'in' = recurring income (Gehalt, Taschengeld), matched on deposits, optionally only on one account;
+                # shares = JSON [{pkey, payee, amount}]: friends paying their part of this Abo, netted against it
+                ("kind", "TEXT DEFAULT 'out'"), ("match_account", "TEXT"), ("shares", "TEXT")]
 
 
 @contextmanager

@@ -102,6 +102,8 @@ def _ledger(month: str) -> dict:
     trend_start = (start - timedelta(days=340)).replace(day=1)
     with firefly.client() as c:
         sp = firefly.splits(c, trend_start, end)
+    with store.connect() as con:
+        shared = _share_index(con)
     months: dict[str, dict] = defaultdict(lambda: {"income": 0.0, "spending": 0.0})
     cats: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))  # month -> cat -> €
     recent = []
@@ -111,6 +113,11 @@ def _ledger(month: str) -> dict:
             continue
         m = s["date"][:7]
         amt = float(s["amount"])
+        sh = shared.get(s["transaction_journal_id"]) if s["type"] == "deposit" else None
+        if sh:  # a friend's part of an Abo: lowers what the Abo's category costs
+            months[m]["spending"] -= amt
+            cats[m][sh["category"]] -= amt
+            continue
         if s["type"] == "withdrawal":
             months[m]["spending"] += amt
             delta = amt
@@ -124,7 +131,10 @@ def _ledger(month: str) -> dict:
             cats[m][cat] += delta
     for s in sorted(sp, key=lambda s: s["date"], reverse=True):
         if s["date"][:7] == month and s["type"] in ("withdrawal", "deposit"):
-            recent.append(_tx(s))
+            t = _tx(s)
+            if s["transaction_journal_id"] in shared:
+                t["share_of"] = shared[s["transaction_journal_id"]]["name"]
+            recent.append(t)
     # what a category usually costs: the mean of the 3 months before this one
     prev = []
     p = start
@@ -156,6 +166,15 @@ def _forecast(L: dict, prev: list[dict], sp: list[dict]) -> dict:
     with store.connect() as con:
         active = [dict(r) for r in con.execute("SELECT * FROM subs WHERE dismissed=0 AND state='active'")]
     step = {"weekly": 7, "monthly": 30.4, "quarterly": 91, "yearly": 365}
+    # regular income other than the salary (Taschengeld) still to come this month
+    extra_in = 0.0
+    for x in [a for a in active if a.get("kind") == "in" and a.get("category") != "Gehalt"]:
+        d = date.fromisoformat(x["next_date"]) if x.get("next_date") else None
+        while d and d <= end:
+            if d > today:
+                extra_in += x["amount"]
+            d += timedelta(days=round(step[x["period"]]))
+    active = [a for a in active if a.get("kind") != "in"]
     due = 0.0
     for x in active:
         d = date.fromisoformat(x["next_date"]) if x.get("next_date") else None
@@ -176,10 +195,14 @@ def _forecast(L: dict, prev: list[dict], sp: list[dict]) -> dict:
     this = gehalt.pop(today.strftime("%Y-%m"), 0.0)
     past = sorted(v for k, v in gehalt.items() if k >= (start - timedelta(days=95)).strftime("%Y-%m"))
     usual_pay = past[len(past) // 2] if past else 0.0
-    income = L["income"] + max(0.0, usual_pay - this)
+    income = L["income"] + max(0.0, usual_pay - this) + extra_in
     return {"spending": round(spend, 2), "income": round(income, 2), "saldo": round(income - spend, 2),
             "subs_due": round(due, 2), "pace_day": round(pace, 2), "days_left": left,
             "rest_out": round(spend - L["spending"], 2), "rest_in": round(income - L["income"], 2)}
+
+
+PER_MONTH = {"weekly": 4.33, "monthly": 1, "quarterly": 1 / 3, "yearly": 1 / 12}
+subs_mod = subs
 
 
 @app.get("/overview", dependencies=[Depends(guard)])
@@ -191,6 +214,10 @@ def overview(month: str | None = None) -> dict:
         pf = [dict(r) for r in con.execute("SELECT day,value,cash,invested FROM portfolio ORDER BY day")]
         last_pos = con.execute("SELECT positions FROM portfolio ORDER BY day DESC LIMIT 1").fetchone()
         subs = [dict(r) for r in con.execute("SELECT * FROM subs WHERE dismissed=0 ORDER BY state, amount DESC")]
+        for x in subs:
+            x["kind"] = x.get("kind") or "out"
+            x["shares"] = subs_mod.share_view(x, _all_splits()) if x.get("shares") else []
+            x["share_monthly"] = round(sum(sh["amount"] for sh in x["shares"] if sh["active"]) * PER_MONTH[x["period"]], 2)
         hidden = [dict(r) for r in con.execute("SELECT key,payee,name,amount,period FROM subs WHERE dismissed=1 ORDER BY payee")]
         run = con.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
     ledger, ledger_error = None, None
@@ -200,8 +227,8 @@ def overview(month: str | None = None) -> dict:
         ledger_error = str(e)[:200]
     invest_value = (pf[-1]["value"] - (pf[-1]["cash"] or 0)) if pf else 0
     cash = sum(a["balance"] or 0 for a in accounts)
-    monthly_subs = sum(s["amount"] * {"weekly": 4.33, "monthly": 1, "quarterly": 1 / 3, "yearly": 1 / 12}[s["period"]]
-                       for s in subs if s["state"] == "active")
+    monthly_subs = sum(s["amount"] * PER_MONTH[s["period"]] - s["share_monthly"] for s in subs if s["state"] == "active" and s["kind"] == "out")
+    monthly_in = sum(s["amount"] * PER_MONTH[s["period"]] for s in subs if s["state"] == "active" and s["kind"] == "in")
     return {
         "setup": {"eb": eb.configured(), "tr": tr.configured(), "tr_login": login.view(), "notify": notify.view(),
                   "eb_app_id": secrets().get("eb", {}).get("app_id", "")[:8]},
@@ -211,6 +238,7 @@ def overview(month: str | None = None) -> dict:
         "net_worth": round(cash + invest_value, 2), "cash": round(cash, 2), "invested_value": round(invest_value, 2),
         "portfolio": {"series": pf[-2:], "positions": _labelled(json.loads(last_pos["positions"]) if last_pos else [])},
         "subs": [x | {"alias": _aliases().get(x.get("pkey") or x["key"])} for x in subs], "subs_hidden": hidden, "subs_monthly": round(monthly_subs, 2),
+        "income_monthly": round(monthly_in, 2),
         "ledger": ledger, "ledger_error": ledger_error, "categories": CATEGORIES,
     }
 
@@ -284,10 +312,13 @@ class SubAdd(BaseModel):
 def subs_add(body: SubAdd) -> dict:
     """You pick the bookings that are one subscription; payee + price + rhythm come from them."""
     ids = set(body.journal_ids)
-    picked = sorted((s for s in _all_splits() if s["transaction_journal_id"] in ids and s["type"] == "withdrawal"),
+    picked = sorted((s for s in _all_splits() if s["transaction_journal_id"] in ids and s["type"] in ("withdrawal", "deposit")),
                     key=lambda s: s["date"])
     if not picked:
-        raise HTTPException(400, "keine Abbuchungen ausgewählt")
+        raise HTTPException(400, "keine Buchungen ausgewählt")
+    if len({s["type"] for s in picked}) > 1:
+        raise HTTPException(400, "nur Abbuchungen oder nur Eingänge auswählen")
+    kind = "in" if picked[0]["type"] == "deposit" else "out"
     keys = {_pkey(s) for s in picked}
     if len(keys) > 1 or not next(iter(keys)):
         raise HTTPException(400, "die Buchungen gehören zu verschiedenen Empfängern")
@@ -296,20 +327,69 @@ def subs_add(body: SubAdd) -> dict:
     median = amounts[len(amounts) // 2]
     days = sorted({date.fromisoformat(s["date"][:10]) for s in picked})
     period = body.period if body.period in subs.PER_DAYS else subs.guess_period(days)
-    key = f"m:{pkey}:{round(median)}"
-    sub = {"key": key, "payee": picked[-1].get("destination_name") or pkey, "name": (body.name or "").strip()[:80] or None,
-           "category": picked[-1].get("category_name"), "period": period, "amount": round(float(picked[-1]["amount"]), 2),
-           "pkey": pkey, "match_amount": round(float(picked[-1]["amount"]), 2)}
+    key = f"{'in' if kind == 'in' else 'm'}:{pkey}:{round(median)}"
+    last_amt = round(float(picked[-1]["amount"]), 2)
+    # income paid in uneven parts (salary: Abschlag + Abrechnung) matches any amount from that payer
+    match_amount = None if kind == "in" and amounts[-1] > 1.5 * amounts[0] else last_amt
+    accts = {s["destination_name"] if kind == "in" else s["source_name"] for s in picked}
+    sub = {"key": key, "payee": (picked[-1].get("source_name") if kind == "in" else picked[-1].get("destination_name")) or pkey,
+           "name": (body.name or "").strip()[:80] or None,
+           "category": picked[-1].get("category_name"), "period": period, "amount": last_amt,
+           "pkey": pkey, "match_amount": match_amount, "match_account": accts.pop() if kind == "in" and len(accts) == 1 else None}
     with store.connect() as con:
-        con.execute("INSERT INTO subs (key,payee,name,category,period,amount,prev_amount,count,first_seen,state,manual,pkey,match_amount,dismissed) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,0) ON CONFLICT(key) DO UPDATE SET period=excluded.period, name=COALESCE(excluded.name,name), dismissed=0",
+        con.execute("INSERT INTO subs (key,payee,name,category,period,amount,prev_amount,count,first_seen,state,manual,pkey,match_amount,dismissed,kind,match_account) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,0,?,?) ON CONFLICT(key) DO UPDATE SET period=excluded.period, name=COALESCE(excluded.name,name), dismissed=0",
                     (key, sub["payee"], sub["name"], sub["category"], period, sub["amount"], sub["amount"], len(picked),
-                     store.now(), "active", pkey, sub["match_amount"]))
+                     store.now(), "active", pkey, sub["match_amount"], kind, sub["match_account"]))
         # the detector's row for the same payee/price would double-count it
-        con.execute("UPDATE subs SET dismissed=1 WHERE manual=0 AND key=? AND abs(amount-?) <= 0.25*?", (pkey, median, median))
+        if kind == "out":
+            con.execute("UPDATE subs SET dismissed=1 WHERE manual=0 AND key=? AND abs(amount-?) <= 0.25*?", (pkey, median, median))
         row = dict(con.execute("SELECT * FROM subs WHERE key=?", (key,)).fetchone())
         subs.refresh_manual(con, row, _all_splits())
-    return {"ok": True, "key": key, "period": period}
+    _cache.clear()
+    return {"ok": True, "key": key, "period": period, "kind": kind}
+
+
+class SubShare(BaseModel):
+    key: str
+    journal_ids: list[str] = []
+    remove: str | None = None  # a payer's pkey to unlink
+
+
+@app.post("/subs/share", dependencies=[Depends(guard)])
+def subs_share(body: SubShare) -> dict:
+    """Friends paying their part of an Abo (YouTube family): pick their deposits, one payer each; their
+    payments are then netted against the Abo and count as a refund, not as income."""
+    with store.connect() as con:
+        row = con.execute("SELECT * FROM subs WHERE key=?", (body.key,)).fetchone()
+        if not row or (row["kind"] or "out") != "out":
+            raise HTTPException(404, "kein solches Abo")
+        shares = {x["pkey"]: x for x in json.loads(row["shares"] or "[]")}
+        if body.remove:
+            shares.pop(body.remove, None)
+        ids = set(body.journal_ids)
+        picked = sorted((s for s in _all_splits() if s["transaction_journal_id"] in ids and s["type"] == "deposit"), key=lambda s: s["date"])
+        if ids and not picked:
+            raise HTTPException(400, "nur Eingänge können Anteile sein")
+        for s in picked:  # the latest booking per payer sets what they pay
+            k = _pkey(s)
+            if k:
+                shares[k] = {"pkey": k, "payee": s.get("source_name") or k, "amount": round(float(s["amount"]), 2)}
+        con.execute("UPDATE subs SET shares=? WHERE key=?", (json.dumps(list(shares.values())) if shares else None, body.key))
+    _cache.clear()
+    return {"ok": True, "shares": len(shares)}
+
+
+def _share_index(con) -> dict:
+    """journal id -> the Abo it's a friend's share of (so the month counts it as a refund of that Abo)."""
+    out = {}
+    sp = None
+    for r in con.execute("SELECT * FROM subs WHERE dismissed=0 AND shares IS NOT NULL"):
+        sp = sp if sp is not None else _all_splits()
+        for s, _ in subs.share_rows(dict(r), sp):
+            out[s["transaction_journal_id"]] = {"key": r["key"], "name": r["name"] or _aliases().get(r["pkey"] or r["key"]) or r["payee"],
+                                                "category": r["category"] or "Abos & Software"}
+    return out
 
 
 class SubEdit(BaseModel):

@@ -139,7 +139,7 @@ def month_report(month: str) -> str:
     if big:
         lines.append("Größte: " + ", ".join(f"{t['alias'] or t['payee']} {_eur(-t['amount'])}" for t in big))
     with store.connect() as con:
-        subs = [dict(r) for r in con.execute("SELECT * FROM subs WHERE dismissed=0 AND state='active'")]
+        subs = [dict(r) for r in con.execute("SELECT * FROM subs WHERE dismissed=0 AND state='active' AND COALESCE(kind,'out')='out'")]
     per = {"weekly": 4.33, "monthly": 1, "quarterly": 1 / 3, "yearly": 1 / 12}
     lines.append(f"Abos: {_eur(sum(x['amount'] * per[x['period']] for x in subs))} / Monat")
     t0 = datetime.combine(start, datetime.min.time()).timestamp()
