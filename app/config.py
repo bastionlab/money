@@ -17,9 +17,6 @@ FIREFLY_TOKEN_FILE = ETC / "firefly_token"
 OLLAMA = "http://192.168.1.55:11434"
 MODEL = "qwen3.5:9b"
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
 # Enable Banking sends the browser back here after the bank login; it must be whitelisted in the EB app.
 REDIRECT_URL = os.environ.get("MONEY_REDIRECT_URL", "https://dash.example.ts.net/money")
 # PSD2 caps consents at 180 days; ask for the max and remind a week before it runs out.

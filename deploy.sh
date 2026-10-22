@@ -8,8 +8,7 @@ echo "-> syncing code"
 tar -C "$DIR" --exclude=__pycache__ -cf - app systemd | pct exec $CT -- tar -C /opt/money -xf -
 
 echo "-> env"
-TG=$(pct exec 107 -- grep -E '^TELEGRAM_(TOKEN|CHAT_ID)=' /etc/deals/deals.env || true)
-pct exec $CT -- sh -c "umask 077; mkdir -p /etc/money; printf 'MONEY_API_TOKEN=%s\n%s\n' '$(cat "$DIR/token")' '$TG' > /etc/money/money.env"
+pct exec $CT -- sh -c "umask 077; mkdir -p /etc/money; printf 'MONEY_API_TOKEN=%s\n' '$(cat "$DIR/token")' > /etc/money/money.env"
 
 echo "-> units"
 pct exec $CT -- sh -c 'install -m644 /opt/money/systemd/money-* /etc/systemd/system/ \

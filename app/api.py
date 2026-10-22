@@ -203,7 +203,7 @@ def overview(month: str | None = None) -> dict:
     monthly_subs = sum(s["amount"] * {"weekly": 4.33, "monthly": 1, "quarterly": 1 / 3, "yearly": 1 / 12}[s["period"]]
                        for s in subs if s["state"] == "active")
     return {
-        "setup": {"eb": eb.configured(), "tr": tr.configured(), "tr_login": login.view(), "telegram": notify.view(),
+        "setup": {"eb": eb.configured(), "tr": tr.configured(), "tr_login": login.view(), "notify": notify.view(),
                   "eb_app_id": secrets().get("eb", {}).get("app_id", "")[:8]},
         "syncing": _syncing(),
         "last_run": dict(run) | {"summary": json.loads(run["summary"])} if run else None,
@@ -411,22 +411,9 @@ def networth() -> dict:
     return out
 
 
-class Token(BaseModel):
-    token: str
-
-
-@app.post("/telegram/config", dependencies=[Depends(guard)])
-def telegram_config(body: Token) -> dict:
-    try:
-        return notify.setup_own(body.token.strip())
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(400, str(e)[:200]) from e
-
-
-@app.post("/telegram/test", dependencies=[Depends(guard)])
-def telegram_test() -> dict:
-    v = notify.view()
-    return v | {"sent": notify.send("✅ Money-Benachrichtigungen kommen ab jetzt hier an.")}
+@app.post("/notify/test", dependencies=[Depends(guard)])
+def notify_test() -> dict:
+    return notify.view() | {"sent": notify.send("✅ Money-Benachrichtigungen kommen ab jetzt hier an.")}
 
 
 @app.get("/report", dependencies=[Depends(guard)])
