@@ -33,7 +33,12 @@ def session():
     """A logged-in client from the saved cookie, or None if TR wants a fresh login."""
     tr = _api()
     try:
-        return tr if tr.resume_websession() else None
+        if not tr.resume_websession():
+            return None
+        # resuming hits /auth/web/session, which hands out fresh cookies; pytr never writes them back, so
+        # without this the file keeps the login-time tr_refresh and dies 24 h after the tap
+        tr.save_websession()
+        return tr
     except Exception as e:  # noqa: BLE001 - pytr raises whatever requests/TR throw
         log.info("resume failed: %s", e)
         return None
