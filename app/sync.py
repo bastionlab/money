@@ -152,9 +152,7 @@ def sync_tr(c, summary: dict, new: list[dict]) -> None:
             a = con.execute("SELECT * FROM accounts WHERE key='tr:cash'").fetchone()
         a = dict(a)
     t = tr.session()
-    if not t:
-        t = _tr_relogin()
-    if not t:
+    if not t:   # TR caps a login at 24 h; no auto prompt, you log in from Konten when you want fresh data
         with store.connect() as con:
             con.execute("UPDATE accounts SET error=? WHERE key='tr:cash'", ("Login nötig – in der TR-App bestätigen", ))
         summary["Trade Republic"] = "needs login"
@@ -186,22 +184,6 @@ def sync_tr(c, summary: dict, new: list[dict]) -> None:
         with store.connect() as con:
             con.execute("UPDATE accounts SET error=? WHERE key='tr:cash'", (str(e)[:300],))
         summary["Trade Republic"] = f"error: {str(e)[:80]}"
-
-
-def _tr_relogin():
-    """Cookie expired: at most once a day and only while you're likely awake, ask for one tap in the TR app."""
-    hour = datetime.now().hour
-    last = store.get("tr_auto_login", 0)
-    if not (9 <= hour < 22) or time.time() - last < 20 * 3600:
-        return None
-    store.put("tr_auto_login", time.time())
-    try:
-        return tr.unattended_login(lambda: notify.send(
-            "Trade Republic möchte einen neuen Login – bitte jetzt in der TR-App bestätigen (2 Min).", "alerts"))
-    except Exception as e:  # noqa: BLE001
-        log.info("tr relogin: %s", e)
-        notify.send(f"Trade-Republic-Login nicht bestätigt. Neu anmelden: {REDIRECT_URL}", "alerts")
-        return None
 
 
 OWN_PARTIES = re.compile(r"paypal|trade republic|dkb|deutsche kreditbank", re.I)
