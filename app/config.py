@@ -14,7 +14,7 @@ TR_COOKIES = STATE / "tr-cookies.txt"
 FIREFLY = os.environ.get("FIREFLY_URL", "http://127.0.0.1:8080")
 FIREFLY_TOKEN_FILE = ETC / "firefly_token"
 
-OLLAMA = "http://192.168.1.55:11434"
+OLLAMA = os.environ.get("MONEY_OLLAMA_URL", "http://192.168.1.55:11434")  # deploy.sh sets it from the dashboard config
 MODEL = "qwen3.5:9b"
 
 # Enable Banking sends the browser back here after the bank login; it must be whitelisted in the EB app.

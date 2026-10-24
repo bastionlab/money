@@ -1,0 +1,11 @@
+# Firefly III for the money backend; bootstrap.sh copies this to /opt/firefly and writes .env next to it
+services:
+  app:
+    image: fireflyiii/core:latest
+    container_name: firefly
+    restart: always
+    env_file: .env
+    ports: ["8080:8080"]
+    volumes:
+      - ./upload:/var/www/html/storage/upload
+      - ./database:/var/www/html/storage/database
