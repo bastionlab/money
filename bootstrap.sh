@@ -10,7 +10,7 @@ CT=${DASH_CT:?DASH_CT not set}
 [ -s "$DIR/token" ] || (umask 077; openssl rand -hex 32 > "$DIR/token")
 IP=$(pct exec "$CT" -- hostname -I | awk '{print $1}')
 TZ=$(timedatectl show -p Timezone --value 2>/dev/null || echo Europe/Berlin)
-pct exec "$CT" -- sh -c 'export DEBIAN_FRONTEND=noninteractive
+pct exec "$CT" -- sh -c 'export DEBIAN_FRONTEND=noninteractive LC_ALL=C
   apt-get update -q && apt-get install -y -q python3 python3-venv ca-certificates docker.io docker-compose >/dev/null
   mkdir -p /opt/money /opt/firefly/upload /opt/firefly/database /etc/money && chmod 700 /etc/money
   chown -R 33:33 /opt/firefly/upload /opt/firefly/database
