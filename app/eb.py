@@ -49,6 +49,8 @@ def aspsps(country: str = "DE") -> list[dict]:
 
 def start(aspsp: str, country: str = "DE", max_seconds: int | None = None) -> dict:
     """Begin a bank login; the browser goes to `url` and comes back to REDIRECT_URL?code=…&state=…"""
+    if not REDIRECT_URL:
+        raise RuntimeError("MONEY_REDIRECT_URL is not set (deploy.sh writes it to /etc/money/money.env)")
     state = uuid.uuid4().hex
     secs = min(CONSENT_DAYS * 86400, max_seconds or CONSENT_DAYS * 86400) - 300
     until = (datetime.now(timezone.utc) + timedelta(seconds=secs)).isoformat(timespec="seconds")

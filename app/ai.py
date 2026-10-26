@@ -1,4 +1,4 @@
-"""Categorization: Firefly rules first, then what you taught it (payee memory), then qwen in CT 105.
+"""Categorization: Firefly rules first, then what you taught it (payee memory), then qwen on Ollama (Local AI).
 
 `think: false` is load-bearing: thinking costs ~25x the tokens for a one-word answer.
 """
@@ -14,7 +14,7 @@ from .config import CATEGORIES, MODEL, OLLAMA
 
 log = logging.getLogger("ai")
 
-SYSTEM = """Du ordnest Kontobewegungen eines Privatkontos in Berlin einer Kategorie zu.
+SYSTEM = """Du ordnest Kontobewegungen eines Privatkontos in Deutschland einer Kategorie zu.
 Antworte pro Buchung mit genau einer Kategorie aus dieser Liste, in derselben Reihenfolge:
 {cats}
 

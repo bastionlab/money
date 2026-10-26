@@ -1,6 +1,6 @@
 """API for the dashboard's /money page.
 
-Same trust model as the deals API: LAN bind, source-IP allowlist (CT 104 + pve), bearer token.
+Same trust model as the deals API: LAN bind, source-IP allowlist (the dashboard and the host), bearer token.
 Bank secrets are write-only from here: they are stored, never returned.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ from .ai import norm_payee
 from .config import CATEGORIES, HISTORY_DAYS, NOT_SPENDING, save_secrets, secrets
 
 TOKEN = os.environ.get("MONEY_API_TOKEN", "")
-ALLOWED = {ip for ip in os.environ.get("MONEY_API_ALLOW", "192.168.1.54,192.168.1.50,127.0.0.1").split(",") if ip}
+ALLOWED = {ip for ip in os.environ.get("MONEY_API_ALLOW", "127.0.0.1").split(",") if ip}
 INCOME = {"Gehalt", "Sonstige Einnahmen"}
 # money in under these is income too (a tax refund, an unsorted payment), not a refund that lowers spending
 INCOME_LIKE = {"Sonstiges", "Steuern", "Geschenke & Spenden"}
@@ -437,7 +437,7 @@ class Rename(BaseModel):
 
 @app.post("/payee/rename", dependencies=[Depends(guard)])
 def payee_rename(body: Rename) -> dict:
-    """A readable name for a payee ('H.R..Ullrich.Handels.Ge/Berlin' -> 'Ullrich'), shown everywhere; empty = back to the bank's."""
+    """A readable name for a payee ('H.R..Ullrich.Handels.Ge/Stadt' -> 'Ullrich'), shown everywhere; empty = back to the bank's."""
     key = norm_payee(body.name)
     if not key:
         raise HTTPException(400, "kein Empfänger")

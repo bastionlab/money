@@ -190,7 +190,7 @@ OWN_PARTIES = re.compile(r"paypal|trade republic|dkb|deutsche kreditbank", re.I)
 
 
 def _own_names() -> set[str]:
-    """Account holder names ('DKB Erika Mustermann' -> 'maximilian mirnik') to tell your own transfers apart."""
+    """Account holder names ('DKB Erika Mustermann' -> 'erika mustermann') to tell your own transfers apart."""
     with store.connect() as con:
         names = [r["name"] for r in con.execute("SELECT name FROM accounts")]
     return {" ".join(n.lower().split()[1:3]) for n in names if len(n.split()) >= 3}
@@ -294,7 +294,7 @@ def remind_consents() -> None:
     soon = (datetime.now(timezone.utc) + timedelta(days=REMIND_DAYS)).isoformat()
     with store.connect() as con:
         for l in con.execute("SELECT * FROM links WHERE valid_until < ? AND reminded < ?", (soon, time.time() - 86400)):
-            notify.send(f"{l['aspsp']}: Kontozugriff läuft am {l['valid_until'][:10]} ab – einmal neu verbinden: {REDIRECT_URL}", "alerts")
+            notify.send(f"{l['aspsp']}: Kontozugriff läuft am {l['valid_until'][:10]} ab – einmal neu verbinden{': ' + REDIRECT_URL if REDIRECT_URL else ''}", "alerts")
             con.execute("UPDATE links SET reminded=? WHERE session_id=?", (time.time(), l["session_id"]))
 
 

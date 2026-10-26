@@ -14,11 +14,12 @@ TR_COOKIES = STATE / "tr-cookies.txt"
 FIREFLY = os.environ.get("FIREFLY_URL", "http://127.0.0.1:8080")
 FIREFLY_TOKEN_FILE = ETC / "firefly_token"
 
-OLLAMA = os.environ.get("MONEY_OLLAMA_URL", "http://192.168.1.55:11434")  # deploy.sh sets it from the dashboard config
+OLLAMA = os.environ.get("MONEY_OLLAMA_URL", "http://127.0.0.1:11434")  # deploy.sh sets it from the dashboard config
 MODEL = "qwen3.5:9b"
 
-# Enable Banking sends the browser back here after the bank login; it must be whitelisted in the EB app.
-REDIRECT_URL = os.environ.get("MONEY_REDIRECT_URL", "https://dash.example.ts.net/money")
+# Enable Banking sends the browser back here after the bank login (the dashboard's /money page);
+# it must be whitelisted in the EB app. deploy.sh sets it from the dashboard config.
+REDIRECT_URL = os.environ.get("MONEY_REDIRECT_URL", "")
 # PSD2 caps consents at 180 days; ask for the max and remind a week before it runs out.
 CONSENT_DAYS = 180
 REMIND_DAYS = 7
