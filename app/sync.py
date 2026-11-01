@@ -105,6 +105,52 @@ def _paypal_funding(c, con, acc: dict, rows: list[dict]) -> None:
                 r["category"] = s["category_name"]
 
 
+def pair_late_paypal(c) -> int:
+    """The bank debit can book AFTER the PayPal purchase was already synced (purchase 28th, 'Ihr Einkauf bei' debit 29th),
+    so _paypal_funding never saw it. Pair such leftovers now: debit -> Umbuchung + top-up into PayPal, purchase counted once."""
+    with store.connect() as con:
+        pp = {r["firefly_id"] for r in con.execute("SELECT firefly_id FROM accounts WHERE lower(name) LIKE 'paypal%'")}
+    if not pp:
+        return 0
+    sp = firefly.splits(c, date.today() - timedelta(days=30), date.today())
+    debits = [s for s in sp if s["type"] == "withdrawal" and s["source_id"] not in pp and s.get("category_name") != "Umbuchung"
+              and PAYPAL_DEBIT.search(f"{s.get('description') or ''} {s.get('notes') or ''}")]
+    buys = [s for s in sp if s["type"] == "withdrawal" and s["source_id"] in pp and s.get("category_name") != "Umbuchung"]
+    topups = [s for s in sp if (s.get("description") or "").startswith("PayPal-Aufladung")]
+    n = 0
+    for s in debits:
+        d = date.fromisoformat(s["date"][:10])
+        first = (ai.norm_payee(s.get("destination_name") or "").split() or [""])[0]
+        best = None
+        for b in buys:
+            gap = (d - date.fromisoformat(b["date"][:10])).days
+            bd = date.fromisoformat(b["date"][:10])
+            if not first or (ai.norm_payee(b.get("destination_name") or "").split() or [""])[0] != first:
+                continue
+            if float(s["amount"]) > float(b["amount"]) + 0.005 or not -2 <= gap <= 7:
+                continue
+            if any(t["description"] == f"PayPal-Aufladung für {b.get('destination_name')}" and abs((date.fromisoformat(t["date"][:10]) - bd).days) <= 9
+                   for t in topups):
+                continue  # this purchase already has its debit
+            if best is None or abs(gap) < best[0]:
+                best = (abs(gap), b)
+        if not best:
+            continue
+        b = best[1]
+        buys.remove(b)
+        try:
+            firefly.add(c, account_id=b["source_id"], amount=float(s["amount"]), day=s["date"][:10], payee=s.get("source_name") or "Bank",
+                        description=f"PayPal-Aufladung für {b.get('destination_name')}", external_id=("late:" + s["transaction_journal_id"])[:250],
+                        category="Umbuchung")
+        except firefly.Duplicate:
+            continue
+        if s.get("category_name") and s["category_name"] not in ("Sonstiges", "Umbuchung") and b.get("category_name") in (None, "Sonstiges"):
+            firefly.set_category(c, b["group_id"], b["transaction_journal_id"], s["category_name"])
+        firefly.set_category(c, s["group_id"], s["transaction_journal_id"], "Umbuchung")
+        n += 1
+    return n
+
+
 def sync_eb(c, summary: dict, new: list[dict]) -> None:
     if not eb.configured():
         return
@@ -309,6 +355,7 @@ def run() -> dict:
             sync_eb(c, summary, new)
             sync_tr(c, summary, new)
             summary["categorized"] = categorize(c, new)
+            summary["paypal_late"] = pair_late_paypal(c)
             summary["transfers"] = pair_transfers(c)
             summary["cashback"] = cashback.split(c)
             all_splits = firefly.splits(c, date.today() - timedelta(days=HISTORY_DAYS), date.today())

@@ -14,8 +14,8 @@ tar -C "$DIR" --exclude=__pycache__ -cf - app systemd requirements.txt | pct exe
 pct exec "$CT" -- sh -c '/opt/money/venv/bin/pip install -q -r /opt/money/requirements.txt'
 
 echo "-> env"
-pct exec "$CT" -- sh -c "umask 077; mkdir -p /etc/money; printf 'MONEY_API_TOKEN=%s\nMONEY_OLLAMA_URL=http://%s:11434\nMONEY_API_ALLOW=%s,%s,127.0.0.1\nMONEY_REDIRECT_URL=https://dash.%s/money\n' \
-  '$(cat "$DIR/token")' '$(c .cts.ai.ip)' '$(c .cts.dash.ip)' '$(c .lan.host_ip)' '$(c .tailnet)' > /etc/money/money.env"
+pct exec "$CT" -- sh -c "umask 077; mkdir -p /etc/money; printf 'MONEY_API_TOKEN=%s\nMONEY_OLLAMA_URL=%s\nMONEY_API_ALLOW=%s,%s,127.0.0.1\nMONEY_REDIRECT_URL=https://dash.%s/money\n' \
+  '$(cat "$DIR/token")' '$(c '(.ollama_proxy | select(. != "" and . != null)) // ("http://" + .cts.ai.ip + ":11434")')' '$(c .cts.dash.ip)' '$(c .lan.host_ip)' '$(c .tailnet)' > /etc/money/money.env"
 FT=$(jq -r '.firefly_token.value // empty' /etc/dash/secrets/money.json 2>/dev/null || true)
 if [ -n "$FT" ]; then
   printf '%s' "$FT" | pct exec "$CT" -- sh -c 'umask 077; cat > /etc/money/firefly_token'

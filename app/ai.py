@@ -70,7 +70,7 @@ def _batch(items: list[dict]) -> list[str]:
             "messages": [{"role": "system", "content": SYSTEM.format(cats=", ".join(CATEGORIES))},
                          {"role": "user", "content": lines}]}
     try:
-        r = httpx.post(f"{OLLAMA}/api/chat", json=body, timeout=180)
+        r = httpx.post(f"{OLLAMA}/api/chat", json=body, headers={"X-Job": "money-categories"}, timeout=180)
         r.raise_for_status()
         cats = json.loads(r.json()["message"]["content"])["categories"]
     except Exception as e:  # noqa: BLE001 - the model being down just means "Sonstiges" for now
